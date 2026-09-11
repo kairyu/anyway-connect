@@ -1,0 +1,49 @@
+{
+  "_comment": "Reference for the AnywayConnect config format (schema version 2). The app does NOT install or seed this file — a fresh install starts with zero profiles. Copy it to ~/.config/anyway-connect/config.json only if you would rather hand-write a profile than use Settings. Fully generic: no vendor defaults.",
+  "version": 2,
+  "general": {
+    "_comment": "Blank paths mean auto-detect.",
+    "openconnectPath": "",
+    "vpncScript": "",
+    "externalBrowser": "",
+    "menubar": {
+      "showEndpointName": true
+    },
+    "autoReconnect": {
+      "enabled": false,
+      "maxRetries": 5,
+      "retryDelaySeconds": 5
+    }
+  },
+  "activeProfileID": "11111111-2222-3333-4444-555555555555",
+  "profiles": [
+    {
+      "id": "11111111-2222-3333-4444-555555555555",
+      "name": "Example",
+      "protocol": "anyconnect",
+      "authgroup": "",
+      "csdEnabled": false,
+      "csdWrapper": "",
+      "lanAccess": {
+        "autoAddLocalSubnet": true,
+        "manualExceptionRoutes": [
+          "192.168.50.0/24"
+        ]
+      },
+      "endpoints": [
+        {
+          "key": "home",
+          "label": "Example Home Gateway",
+          "host": "vpn.example.com",
+          "favorite": true
+        },
+        {
+          "key": "work",
+          "label": "Example Work Gateway",
+          "host": "gateway.example.net",
+          "favorite": false
+        }
+      ]
+    }
+  ]
+}

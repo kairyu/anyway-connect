@@ -1,0 +1,254 @@
+name: Release
+
+# Signed, notarized, stapled build attached to a GitHub release.
+#
+# Runs only on a version tag, because unlike CI this needs secrets and Apple's
+# notarization service, and it cannot work on a fork or from a pull request — secrets are
+# not exposed there by design.
+#
+# Required repository secrets:
+#
+#   APPLE_CERT_P12          Developer ID Application certificate *and its private key*,
+#                           exported from Keychain Access as .p12, then base64 encoded:
+#                             base64 -i cert.p12 | pbcopy
+#   APPLE_CERT_PASSWORD     the password set during that export
+#   APPLE_API_KEY           App Store Connect API key (.p8), base64 encoded
+#   APPLE_API_KEY_ID        its Key ID
+#   APPLE_API_ISSUER_ID     the issuer UUID from App Store Connect
+#
+# The signing identity itself is not a secret: build-app.sh finds it in the keychain.
+# The keychain password is generated per run rather than stored, since it protects
+# nothing beyond the life of the job.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to create the release and upload to it
+
+jobs:
+  release:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install openconnect (for vpnc-script)
+        run: brew install openconnect
+
+      # A dedicated, throwaway keychain. Importing into the login keychain would leave
+      # the key on a shared runner image and require unlocking it, and deleting it
+      # afterwards is what keeps the private key's lifetime equal to the job's.
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # :- so an empty export password is a valid answer rather than a `set -u`
+          # failure. Keychain Access allows exporting a .p12 with no password, and
+          # `security import -P ""` accepts one, so the secret may legitimately be unset.
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "${APPLE_CERT_PASSWORD:-}" -T /usr/bin/codesign -T /usr/bin/security
+          # Without this codesign blocks on a UI prompt for permission to use the key,
+          # and the job hangs until it times out rather than failing.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Put it on the search list so `security find-identity` — which build-app.sh
+          # uses to choose an identity — can see it.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          echo "identities available:"
+          security find-identity -v -p codesigning | sed 's/^/  /'
+
+      # Passed explicitly rather than left to build-app.sh's git fallback: a
+      # tag-triggered checkout is shallow and need not have fetched the tag object, so
+      # `git describe` cannot be relied on here.
+      - name: Build
+        env:
+          ANYWAY_VERSION: ${{ github.ref_name }}
+        run: ./build-app.sh
+
+      # Fails the release if the build fell back to ad-hoc signing. Without this the job
+      # would carry on and produce an unsignable, unnotarizable artifact, and the first
+      # sign of trouble would be a user's Gatekeeper dialog.
+      - name: Require a Developer ID signature
+        run: |
+          codesign -dv --verbose=4 AnywayConnect.app 2>&1 \
+            | grep -q "^Authority=Developer ID Application" \
+            || { echo "::error::build did not use a Developer ID identity"; exit 1; }
+
+      # EXPECT_VERSION makes verify-bundle assert the bundle really carries the tag's
+      # version, so a release can never ship a bundle that disagrees with its own name.
+      - name: Verify bundle invariants
+        env:
+          EXPECT_VERSION: ${{ github.ref_name }}
+        run: sh scripts/verify-bundle.sh AnywayConnect.app
+
+      - name: Test connect flow
+        run: sh test/test-connect-flow.sh
+
+      # Notarization needs credentials that only a person can create — the App Store
+      # Connect API key is generated in a browser and its .p8 downloads once. Rather than
+      # fail a release over a key that may not exist yet, this degrades: the build is
+      # still signed, verified and published, but it is labelled unmistakably and the
+      # Homebrew tap is left alone, because a cask pointing at an unnotarized zip would be
+      # worse than no cask at all.
+      #
+      # Deliberately loud rather than silent. An unnotarized build looks identical to a
+      # notarized one until someone else tries to open it, at which point Gatekeeper
+      # refuses it — so the warning, the prerelease flag and the release notes all say so.
+      - name: Notarize and staple
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -eu
+          if [ -z "${APPLE_API_KEY:-}" ] || [ -z "${APPLE_API_KEY_ID:-}" ] \
+             || [ -z "${APPLE_API_ISSUER_ID:-}" ]; then
+            echo "NOTARIZED=false" >> "$GITHUB_ENV"
+            echo "::warning title=Not notarized::No App Store Connect API key is configured, so this release is signed but NOT notarized. Gatekeeper will refuse it on any machine that did not build it, and Homebrew cannot install it. Set APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID to enable notarization."
+            exit 0
+          fi
+          echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/api.p8"
+          xcrun notarytool store-credentials anyway-notary \
+            --key "$RUNNER_TEMP/api.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --keychain "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/api.p8"
+          # Same script used locally, so the release path and the manual path cannot
+          # diverge.
+          ANYWAY_NOTARY_PROFILE=anyway-notary sh scripts/notarize.sh AnywayConnect.app
+          echo "NOTARIZED=true" >> "$GITHUB_ENV"
+
+      - name: Confirm Gatekeeper accepts it
+        if: env.NOTARIZED == 'true'
+        run: |
+          spctl -a -vvv --type exec AnywayConnect.app 2>&1 | tee /tmp/spctl.txt
+          grep -q "source=Notarized Developer ID" /tmp/spctl.txt \
+            || { echo "::error::bundle is not seen as notarized"; exit 1; }
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ZIP="AnywayConnect-${GITHUB_REF_NAME}.zip"
+          # notarize.sh re-packages after stapling, so that zip carries the ticket. When
+          # notarization was skipped it does not exist and the bundle is packaged here
+          # instead — with ditto either way, since the signature covers symlinks.
+          if [ -f AnywayConnect-notarized.zip ]; then
+            mv AnywayConnect-notarized.zip "$ZIP"
+          else
+            ditto -c -k --sequesterRsrc --keepParent AnywayConnect.app "$ZIP"
+          fi
+          # Checked explicitly because the hash below runs through a pipe, and a pipeline
+          # takes its exit status from the last command — so a failing shasum would be
+          # swallowed by tee and publish an empty .sha256 next to a missing asset.
+          [ -s "$ZIP" ] || { echo "::error::packaging produced no $ZIP"; exit 1; }
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+          if [ "${NOTARIZED:-false}" = "true" ]; then
+            gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+            exit 0
+          fi
+
+          # Marked prerelease for two reasons: it warns a human, and Homebrew's
+          # :github_latest livecheck strategy ignores prereleases — so an unnotarized
+          # build cannot become the version a cask points at.
+          cat > /tmp/notes.md <<'NOTES'
+          > [!WARNING]
+          > This build is **signed but not notarized**. macOS Gatekeeper will refuse to
+          > open it on any machine that did not build it, and it cannot be installed with
+          > Homebrew. Use it only for local testing.
+          >
+          > To produce a notarized release, set `APPLE_API_KEY`, `APPLE_API_KEY_ID` and
+          > `APPLE_API_ISSUER_ID` and tag again.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+            --title "$GITHUB_REF_NAME (unnotarized)" \
+            --prerelease \
+            --notes-file /tmp/notes.md
+
+      # The cask is rendered from the same script used by hand, and attached to the
+      # release as well as pushed, so the exact text that describes a release is
+      # recoverable from the release itself.
+      #
+      # Pushing to a *different* repository needs its own credential: the automatic
+      # github.token is scoped to this one. That credential is an SSH **deploy key** on
+      # the tap rather than a personal access token, chosen for how little it can do — a
+      # deploy key grants git access to exactly one repository and cannot touch the API,
+      # read other repositories, or create releases, even if it leaks. A PAT with `repo`
+      # scope would hand over write access to everything the account owns in order to
+      # publish one text file.
+      #
+      # Without the key set, the cask is still rendered and attached and only the push is
+      # skipped, so a release never fails over a tap that may not exist yet.
+      - name: Update the Homebrew tap
+        if: env.NOTARIZED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          TAP_REPO: kairyu/homebrew-tap
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
+          sh scripts/make-cask.sh "$VERSION" "$SHA" > anyway-connect.rb
+          echo "--- rendered cask ---"; cat anyway-connect.rb
+          gh release upload "$GITHUB_REF_NAME" anyway-connect.rb
+
+          if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
+            echo "::notice::HOMEBREW_TAP_DEPLOY_KEY not set — cask attached to the release but tap not updated"
+            exit 0
+          fi
+
+          KEYFILE="$RUNNER_TEMP/tap_deploy_key"
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+
+          # GitHub's host keys are pinned from its own published set rather than accepted
+          # on first use, so the push cannot be aimed at an impostor host.
+          #
+          # Fetched through `gh` rather than plain curl because it authenticates with
+          # GH_TOKEN. An anonymous request to api.github.com from a runner shares a
+          # heavily used IP pool and comes back 403 on rate limit — which it did.
+          KNOWN="$RUNNER_TEMP/known_hosts"
+          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' > "$KNOWN"
+          [ -s "$KNOWN" ] || { echo "::error::could not fetch GitHub host keys"; exit 1; }
+
+          export GIT_SSH_COMMAND="ssh -i $KEYFILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN"
+          git clone --depth 1 "git@github.com:${TAP_REPO}.git" tap
+          mkdir -p tap/Casks
+          cp anyway-connect.rb tap/Casks/anyway-connect.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/anyway-connect.rb
+          # Nothing to do when re-running a tag against an unchanged cask.
+          git diff --cached --quiet && { echo "cask already current"; exit 0; }
+          git commit -m "anyway-connect ${VERSION}"
+          git push
+          rm -f "$KEYFILE"
+
+      # Runs even when something above failed, so a failed release does not leave a
+      # private key sitting on the runner.
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true

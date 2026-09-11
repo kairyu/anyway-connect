@@ -1,0 +1,78 @@
+name: CI
+
+# Build and test on every push and pull request.
+#
+# Deliberately needs no secrets, so it runs on forks and pull requests too. With no
+# Developer ID in the keychain, build-app.sh warns and signs ad-hoc; that is a fully
+# valid bundle which simply cannot register the privileged daemon. Everything that can
+# be checked without Apple's involvement is checked here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push makes an in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Both are worth covering: the app's deployment target is macOS 13, so building on
+    # the older image is what catches use of an API newer than that target, while the
+    # newer image is what the author actually runs.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Full history, not the default shallow fetch: build-app.sh derives the version
+      # with `git describe`, which needs tags. A shallow clone would silently produce
+      # 0.0.0 and CI would stop testing the versioning at all.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swiftc --version
+
+      # Only needed for its vpnc-script. build-app.sh treats a missing one as a warning
+      # rather than an error, so without this the DNS patch — and the check that the
+      # patch still applies to current upstream — would be silently skipped, which is
+      # the single most valuable thing this job verifies.
+      - name: Install openconnect (for vpnc-script)
+        run: brew install openconnect
+
+      - name: Build
+        run: ./build-app.sh
+
+      - name: Verify bundle invariants
+        run: sh scripts/verify-bundle.sh AnywayConnect.app
+
+      - name: Test connect flow
+        run: sh test/test-connect-flow.sh
+
+      # ditto rather than zip, to preserve the bundle's symlinks and resource forks.
+      # actions/upload-artifact would otherwise flatten the signature and the download
+      # would not verify.
+      - name: Package
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            AnywayConnect.app "AnywayConnect-${{ matrix.runner }}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AnywayConnect-${{ matrix.runner }}
+          path: AnywayConnect-${{ matrix.runner }}.zip
+          if-no-files-found: error
+          retention-days: 14

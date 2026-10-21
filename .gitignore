@@ -18,5 +18,15 @@ state/
 # Agent / editor workspace
 .kiro/
 
+# Agent task artifacts: investigations, designs, reviews, plans and verification
+# evidence, regenerated per task. Useful while the work is in flight and referenced
+# from commit messages, but it is scratch output rather than a source of truth, and it
+# grows without bound. Anything here worth keeping gets promoted into docs/ deliberately.
+.agents/
+
+# Worktrees. `git worktree add .worktrees/<name>` keeps its checkout here; the branch
+# is already in the repository, so the directory is a second copy of the tree.
+.worktrees/
+
 # macOS
 .DS_Store

@@ -38,6 +38,183 @@ private func log(_ message: String) {
     FileHandle.standardError.write(Data("[anyway-helper] \(message)\n".utf8))
 }
 
+// MARK: - The two /var/run state files
+
+/// The hardened writer for BOTH state files — the netstate and the attribution
+/// record — so there is not a second copy of this hardening to keep in step.
+///
+/// Atomic, and it fails SILENTLY to the caller but loudly to the log: a missing
+/// state file only degrades a later reconcile, and must never fail a connect.
+///
+/// `O_EXCL | O_NOFOLLOW` on the temp file, because /var/run is group-writable by
+/// `daemon` and a member of that group could otherwise squat the temp name
+/// between the unlink and the open. O_EXCL turns that into a failed write rather
+/// than a hijacked one — which is why a failed write is an anticipated path here
+/// and not a hypothetical one. Created 0600 and widened to 0644 through the
+/// DESCRIPTOR once the content is ours: the unprivileged app reads these files,
+/// and its own hardening is ownership-based.
+///
+/// A free function rather than a method because the attribution observer runs
+/// from inside a queue closure, where only a free or static function can be
+/// called bare.
+@discardableResult
+private func writeStateFile(path: String, data: Data, label: String) -> Bool {
+    let tmp = path + ".tmp"
+    unlink(tmp)                                   // ENOENT is the expected case
+    let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    guard fd >= 0 else {
+        log("could not open \(tmp): \(String(cString: strerror(errno))) — no \(label)")
+        return false
+    }
+    var ok = true
+    data.withUnsafeBytes { raw in
+        var written = 0
+        while written < raw.count {
+            let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
+            guard n > 0 else { ok = false; return }
+            written += n
+        }
+    }
+    if ok { ok = fchmod(fd, 0o644) == 0 }
+    close(fd)
+    guard ok, rename(tmp, path) == 0 else {
+        unlink(tmp)
+        log("could not write \(label): \(String(cString: strerror(errno)))")
+        return false
+    }
+    return true
+}
+
+/// Writes THIS session's attribution record: who we are, before we know which
+/// interface is ours.
+///
+/// The caller unlinks the path first, so absence — the fail-closed state — is
+/// what a failed write leaves behind rather than the previous session's claim.
+/// `ourTunnel` is nil and the note is "pending" until the observer resolves it.
+private func writeAttributionRecord(pid: pid_t, startedAt: Date, token: String) -> Bool {
+    let record = TunnelAttribution(startedAt: startedAt,
+                                   sessionToken: token,
+                                   tunnelPID: Int(pid),
+                                   attributionNote: "pending")
+    guard let data = try? TunnelAttribution.encoder().encode(record) else {
+        log("could not encode the attribution record — reconcile will plan dead-only")
+        return false
+    }
+    return writeStateFile(path: TunnelAttribution.path, data: data, label: "attribution record")
+}
+
+/// Applies one observation tick to the record and writes it back.
+///
+/// A FREE FUNCTION at file scope, like `observeOurTunnel`, and for the same
+/// reason: it is called bare inside a queue closure, which only compiles for a
+/// free or static function, and an instance member would retain the
+/// per-connection `PrivilegedService` past its connection.
+private func writeAttribution(_ record: inout TunnelAttribution, _ tick: AttributionTick) {
+    switch tick.outcome {
+    case .resolved(let name):
+        record.ourTunnel = name
+        record.ourTunnelObservedAt = Date()
+        // Only ever SET, never cleared by a later tick: once witnessed, the
+        // address is the fact that lets a lingering interface be attributed.
+        if let address = tick.ourTunnelIPv4 { record.ourTunnelIPv4 = address }
+    case .pending, .ambiguous, .processExited, .timedOut:
+        record.ourTunnel = nil
+        record.ourTunnelIPv4 = nil
+    }
+    record.attributionNote = tick.attributionNote
+    guard let data = try? TunnelAttribution.encoder().encode(record) else {
+        log("could not encode the attribution record — leaving the previous one")
+        return
+    }
+    guard writeStateFile(path: TunnelAttribution.path, data: data,
+                         label: "attribution record") else { return }
+    log("attribution: \(tick.outcome) ourTunnel=\(record.ourTunnel ?? "nil") "
+        + "ipv4=\(record.ourTunnelIPv4 ?? "nil") note=\(record.attributionNote ?? "nil")")
+}
+
+/// The netif holding the UNSCOPED default right now, for the ambiguity
+/// tie-break only. Read through the shared bounded `capture` runner, once, at
+/// the deadline — never on every tick.
+private func unscopedDefaultNetifNow() -> String? {
+    NetReconcile.parseRouteTable(NetProbe.routeTable())
+        .first { $0.destination == .defaultRoute && !$0.isIfScoped }?.netif
+}
+
+/// Watch for OUR tunnel to appear, then keep watching until it carries an
+/// address.
+///
+/// This is the hook `preexistingTunnels` existed because the daemon did not
+/// have: at `startTunnel` time our `utun` does not exist yet — the record is
+/// written milliseconds after `task.run()`, before openconnect has
+/// authenticated — so the one positive fact worth recording cannot be recorded
+/// then. It can be recorded 500 ms to a few seconds later, from inside the
+/// daemon, with no new XPC operation and therefore no protocol bump.
+///
+/// FREE FUNCTION at file scope (not a method on PrivilegedService): the listener
+/// builds one service per XPC connection, so a method would need an explicit
+/// `self.` inside the queue closure and would retain the service past the
+/// connection. Everything it needs arrives as a parameter. It executes no
+/// process in the common case, mutates no routing, takes no lock and never
+/// touches the mutation gate.
+///
+/// It does NOT stop at `.resolved`: a `utun` appears before `vpnc-script`
+/// assigns its address, so the witness lands on a later tick than the name. It
+/// keeps polling until the resolved name carries an IPv4 — or the deadline
+/// passes, leaving `"addressPending"` and a session that degrades to dead-only.
+///
+/// 60 s is a ceiling, not an expectation: the cookie is already on stdin when
+/// `task.run()` happens, so authentication is done. The top-end cost is 120
+/// `getifaddrs` calls spread over a minute plus, on the ambiguous path only, one
+/// `netstat`.
+private func observeOurTunnel(pid: pid_t, startedAt: Date, preexisting: Set<String>,
+                              deadline: TimeInterval = 60,
+                              onTick: @escaping (AttributionTick) -> Void) {
+    let began = Date()
+    log("observing for our tunnel: pid \(pid), session started "
+        + "\(ISO8601DateFormatter().string(from: startedAt)), deadline \(Int(deadline))s")
+    // Seeded with what `startTunnel` has just written, so an unchanged tick
+    // writes nothing: the record is rewritten when the ANSWER changes, not 120
+    // times per session.
+    var last: AttributionTick? = AttributionTick(outcome: .pending, ourTunnelIPv4: nil,
+                                                 attributionNote: "pending")
+    while true {
+        let elapsed = Date().timeIntervalSince(began)
+        let interfaces = NetProbe.interfaces()
+        let nowTunnelLike = interfaces.filter(\.isTunnelLike).map(\.name)
+        let newNames = nowTunnelLike.filter { !preexisting.contains($0) }
+        // Read ONLY when it can decide something: at the deadline, with a tie.
+        let defaultNetif = (elapsed >= deadline && newNames.count >= 2)
+            ? unscopedDefaultNetifNow() : nil
+
+        let tick = TunnelAttribution.attributionOutcome(
+            preexisting: preexisting,
+            nowTunnelLike: nowTunnelLike,
+            addressOf: { name in interfaces.first { $0.name == name }?.ipv4?.text },
+            defaultRouteNetif: defaultNetif,
+            // kill(pid, 0) from ROOT, where it means what it says. The app-side
+            // liveness check cannot use it — openconnect runs as root and the
+            // app as uid 504, so EPERM there reads a live tunnel as dead.
+            processAlive: kill(pid, 0) == 0,
+            elapsed: elapsed,
+            deadline: deadline)
+
+        if tick != last {
+            onTick(tick)
+            last = tick
+        }
+        switch tick.outcome {
+        case .ambiguous, .processExited, .timedOut:
+            return
+        case .resolved:
+            if tick.ourTunnelIPv4 != nil { return }      // name AND witness: done
+        case .pending:
+            break
+        }
+        if elapsed >= deadline { return }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+}
+
 // MARK: - Service
 
 final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
@@ -84,6 +261,25 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
     /// plan and a sub-second no-op.
     private static let mutationQueue =
         DispatchQueue(label: "me.kairyu.anywayconnect.privhelper.mutation")
+
+    /// EVERY write to the attribution record goes through this queue, and the
+    /// generation counter lives on it too.
+    ///
+    /// One writer FAMILY — the observer — because the stop path does not touch
+    /// that record at all, so there is no second read-modify-write writer to
+    /// order against. What this does close is the reconnect interleave: the app
+    /// auto-reconnects on its 8 s poll and the listener builds a fresh service
+    /// per connection, so without the counter a session-A observer could write
+    /// `timedOut` over session B's record forty seconds later.
+    private static let attributionQueue =
+        DispatchQueue(label: "me.kairyu.anywayconnect.privhelper.attribution")
+    /// `attributionQueue` only.
+    private static var attributionGeneration = 0
+
+    /// The 500 ms polling loop runs HERE instead, so a 60 s observation never
+    /// occupies the writing queue.
+    private static let observerQueue =
+        DispatchQueue(label: "me.kairyu.anywayconnect.privhelper.observer")
 
     // MARK: Preconditions
 
@@ -283,6 +479,55 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
         writePIDFile(task.processIdentifier)
         writeNetState(preDefault, exceptionRoutes: exceptionRoutes,
                       pid: task.processIdentifier, preexistingTunnels: preTunnels)
+
+        // The attribution record, and the observer that fills it in.
+        //
+        // UNLINK FIRST. Absence is the fail-closed state, so the previous
+        // session's claim is retired BEFORE this one is written: a failed write
+        // must never leave a record describing a session that has ended —
+        // possibly with a witness address the next reconcile would read as this
+        // session's identity. The write failure is designed for rather than
+        // hypothetical (writeStateFile's O_EXCL), and it must never fail a
+        // connect: we log it and still reply `started pid N`.
+        unlink(TunnelAttribution.path)
+        let pid = task.processIdentifier
+        let startedAt = Date()
+        let sessionToken = UUID().uuidString
+        if !writeAttributionRecord(pid: pid, startedAt: startedAt, token: sessionToken) {
+            log("no attribution record for this session — reconcile will plan dead-only")
+        }
+        // Captured by value for the observer: nothing it touches may be read off
+        // the per-connection service, which goes away with the connection.
+        let preTunnelSet = Set(preTunnels)
+        Self.attributionQueue.async {
+            // Bumped unconditionally, including after a failed write: it is what
+            // retires the PREVIOUS session's observer, and that has to happen
+            // whether or not this session got a record.
+            Self.attributionGeneration += 1
+            let mine = Self.attributionGeneration
+            Self.observerQueue.async {
+                observeOurTunnel(pid: pid, startedAt: startedAt,
+                                 preexisting: preTunnelSet) { tick in
+                    Self.attributionQueue.async {
+                        guard mine == Self.attributionGeneration else {
+                            log("attribution tick dropped: superseded by a newer session")
+                            return
+                        }
+                        // NEVER a Date comparison: the pinned encoder emits whole
+                        // seconds, so `startedAt` cannot be a session key. The
+                        // token can, and is.
+                        guard var current = TunnelAttribution.load(note: { log($0) }),
+                              current.tunnelPID == Int(pid),
+                              current.sessionToken == sessionToken else {
+                            log("attribution tick dropped: the record on disk is not ours")
+                            return
+                        }
+                        writeAttribution(&current, tick)
+                    }
+                }
+            }
+        }
+
         log("tunnel started pid=\(task.processIdentifier) host=\(host)\(logNote)")
         reply(true, "started pid \(task.processIdentifier)\(logNote)")
     }
@@ -308,10 +553,24 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
         }
         tunnel = nil
         try? FileManager.default.removeItem(atPath: pidFilePath)
-        // The ONLY remover of the netstate. Reconcile deliberately leaves it: every
-        // later reconcile in this boot needs its tunnel scope and install hint, and a
-        // stale advisory is already fenced by the same-interface-and-subnet precondition
-        // and then by the guard.
+        // TWO /var/run state files, and this path owns the lifetime of exactly ONE
+        // of them.
+        //
+        //   * netstate.json — "our tunnel may have left residue, and here is the
+        //     physical network it displaced". Removed HERE, and only here:
+        //     reconcile deliberately leaves it, because a later reconcile in this
+        //     boot can still use its install hint, and a stale advisory is already
+        //     fenced by the same-interface-and-subnet precondition and then by the
+        //     guard.
+        //   * tunnels.json — "utun7 was ours and it carried 192.168.204.16".
+        //     NEVER touched here, deliberately. It has to OUTLIVE the stop or a
+        //     lingering interface of ours can never be attributed, which is the one
+        //     repair the scope rule keeps. Its lifetime belongs to `startTunnel`
+        //     (unlink, then write) and to /var/run's pruning at boot.
+        //
+        // Conflating the two is the defect this split fixes: one file holding both
+        // meant a clean disconnect deleted the scope, so the next reconcile planned
+        // against every utun on the machine.
         try? FileManager.default.removeItem(atPath: NetState.path)
         reply(true, stubborn.isEmpty ? "stopped" : "stopped (escalated)")
     }
@@ -433,7 +692,10 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
             let plan = NetReconcile.plan(routeTable: NetProbe.routeTable(),
                                          interfaces: NetProbe.interfaces(),
                                          configdKeys: NetProbe.configdServiceKeys(),
-                                         netstate: NetState.load())
+                                         netstate: NetState.load(),
+                                         attribution: TunnelAttribution.load(note: {
+                                             log("reconcile:   \($0)")
+                                         }))
             log("reconcile: gate=proceed, plan \(plan.actions.count) actions, "
                 + "\(plan.kept.count) kept, abort=\(plan.abort.map(String.init(describing:)) ?? "none")"
                 + (dryRun ? " [DRY RUN]" : ""))
@@ -442,21 +704,36 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
             // the count above; printing them all would bury the three that matter.
             for kept in plan.kept {
                 switch kept {
-                case .foreignTunnel, .widenedToAllTunnels, .ambiguousInstallTarget,
-                     .physicalDefaultUnusable, .defaultDeletionsWithheld:
+                case .foreignTunnel, .liveTunnelIdentityUnproven, .ambiguousInstallTarget,
+                     .installWithheldForSurvivingDefault, .physicalDefaultUnusable,
+                     .defaultDeletionsWithheld:
                     log("reconcile:   \(kept)")
                 default:
                     continue
                 }
             }
 
-            let transcript = self.applyReconcile(plan, dryRun: dryRun)
+            // "Absent from a usable snapshot ⇒ provably dead" was decided against the
+            // CLASSIFICATION snapshot, and the deletes it authorises run after the
+            // prologue. A third-party client coming up inside that window would have
+            // its resolver keys removed and its default route deleted on the strength
+            // of a snapshot that is no longer true, so the inference is re-checked
+            // against a fresh one immediately before anything executes. One extra
+            // getifaddrs per reconcile.
+            let fresh = Set(NetProbe.interfaces().map(\.name))
+            let bounded = NetReconcile.dropRevivedTunnelActions(plan, present: fresh)
+            for drop in bounded.dropped { log("reconcile:   dropped — \(drop)") }
+
+            let transcript = self.applyReconcile(bounded.plan, dryRun: dryRun)
             // The full transcript always goes to the log; only the reply is capped.
             for line in transcript { log("reconcile:   \(line)") }
-            // The netstate is deliberately NOT removed here — stopTunnel owns its
-            // lifetime. Deleting it would disarm its tunnel scope and install-target
-            // hint for the rest of the boot, so the next wake and the next Wi-Fi hop
-            // would plan widened to every utun on the machine.
+            // NEITHER state file is removed here.
+            //
+            //   * netstate.json — stopTunnel owns its lifetime. Deleting it would
+            //     disarm its install-target hint for the rest of the boot.
+            //   * tunnels.json — nothing but the next startTunnel ever removes it, so
+            //     a lingering utun of ours stays attributable across as many
+            //     reconciles as it takes for its interface to go.
             reply(true, Self.cap(transcript))
         }
     }
@@ -651,14 +928,9 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
     /// Record what the physical network looked like before this tunnel existed.
     ///
     /// Atomic, and it fails SILENTLY to the caller but loudly to the log: a missing
-    /// netstate only degrades a later reconcile, and must never fail a connect.
-    ///
-    /// `O_EXCL|O_NOFOLLOW` on the temp file, because /var/run is group-writable by
-    /// `daemon` and a member of that group could otherwise squat the temp name between
-    /// the unlink and the open. O_EXCL turns that into a failed write rather than a
-    /// hijacked one. Created 0600 and widened to 0644 through the DESCRIPTOR once the
-    /// content is ours — the unprivileged app reads this file, and its own hardening is
-    /// ownership-based.
+    /// netstate only degrades a later reconcile, and must never fail a connect. The
+    /// descriptor hardening lives in `writeStateFile`, which both state files go
+    /// through so there is only one copy of it to keep in step.
     private func writeNetState(_ physical: (interface: String, gateway: String, subnet: String)?,
                                exceptionRoutes: [String],
                                pid: pid_t,
@@ -682,29 +954,7 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
             log("could not encode netstate — skipped")
             return
         }
-        let tmp = NetState.path + ".tmp"
-        unlink(tmp)                                   // ENOENT is the expected case
-        let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else {
-            log("could not open \(tmp): \(String(cString: strerror(errno))) — no netstate")
-            return
-        }
-        var ok = true
-        data.withUnsafeBytes { raw in
-            var written = 0
-            while written < raw.count {
-                let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
-                guard n > 0 else { ok = false; return }
-                written += n
-            }
-        }
-        if ok { ok = fchmod(fd, 0o644) == 0 }
-        close(fd)
-        guard ok, rename(tmp, NetState.path) == 0 else {
-            unlink(tmp)
-            log("could not write netstate: \(String(cString: strerror(errno)))")
-            return
-        }
+        guard writeStateFile(path: NetState.path, data: data, label: "netstate") else { return }
         log("netstate: \(physical.interface) \(physical.subnet) via \(physical.gateway), "
             + "pre-existing tunnels [\(preexistingTunnels.joined(separator: ", "))]")
     }

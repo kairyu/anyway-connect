@@ -236,6 +236,11 @@ different network" the whole point of the pair.
 | `netstat-rn-inet.dual-default.txt` | synthetic: `en0` and `en8` each with an **`-ifscope`-only** default (`UGScIg`) via its own on-link router — `en0 = 10.0.1.42/24` via `10.0.1.1`, `en8 = 192.168.1.42/24` via `192.168.1.1`, **`en0`'s row printed first** — plus each link's `link#N` on-link row, its `/32` self and router rows and its broadcast row, and two stale `/32` host routes via the dead gateway `100.64.9.9` so the sweep is non-empty and countable. Neither default serves unbound traffic, so clause (f) must install one, which is what makes the fixture a question about *which link* |
 | `interfaces.dual-default.json`, `.reversed.json`, `.en0-absent.json`, `.en0-down.json` | **four snapshots against that one route table.** `dual-default` lists `en0` then `en8`, both up and addressed; `reversed` lists the *same two links* with `en8` first; `en0-absent` has `en8` only (the measured dual-homed transcript, where `en0`'s route rows persist after the link has left the snapshot); `en0-down` has both present and addressed with `en0` `"isUp": false` |
 | `netstat-rn-inet.unspecified-default.txt`, `interfaces.unspecified-default.json` | synthetic: three default rows — `default 0.0.0.0 … UGSc en9`, `default link#7 … UGSc en7`, and `en8`'s healthy `-ifscope` default — against a snapshot holding `en8` **only**. `en9` and `en7` are absent on purpose: `unspecifiedGateway` (step 3) and `malformedGateway` (step 2) are both returned *before* `evaluateDefaultGateway`'s interface lookup, so a default row can name a link that does not exist |
+| `netstat-rn-inet.late-tunnel.txt`, `interfaces.late-tunnel.json`, `scutil-keys.late-tunnel.txt` | synthetic: **three live tunnels** — `utun0`, `utun7`, `utun9` — each with a default row and an IPv4+DNS configd key pair, beside a live `en0 = 10.0.1.22/24` and one UUID-named physical service key. `utun7`'s default is the **unscoped** one and it carries `192.168.204.16`, so it is the one an attribution record can witness; the other two are scoped. The discrimination fixture for the tunnel scope: with `utun7` witnessed, nothing in the plan may name `utun9` |
+| `netstat-rn-inet.live-shape.txt`, `interfaces.live-shape.json` | the **verified live shape** of the developer's machine while connected: an unscoped tunnel default on `utun7` beside a scoped `en0` default, plus `en0`'s on-link rows. The shape in which clause (f) would otherwise emit an install that can only return `EEXIST` |
+| `netstat-rn-inet.live-shape.stale-en8.txt`, `interfaces.live-shape.stale-en8.json` | the same plus a **stale physical default on `en8`** via the dead gateway `100.64.9.9`, with `en8 = 192.168.50.10/24` present, up and addressed in its own snapshot. `en8` has to be usable or its row would be *kept* for a missing target rather than classified stale, and then clause (g) would have nothing to withhold — which is the composition this fixture exists to assert. Paired with its own snapshot rather than with `live-shape`'s for exactly that reason |
+| `interfaces.lo0-only.json` | `lo0` and nothing else: the **unusable snapshot**, which (d″) aborts on and the tunnel scope answers `none` for. Used with `carried-home`'s route table; mirrored on the shell arm by `STUB_SNAPSHOT=lo0-only` |
+| `attribution.{witnessed,mismatch,pending,bad-schema}.json` | the four states of `/var/run/anyway-connect.tunnels.json`, for the shell arm's reader (`test/test-onlink-guard.sh` points `ATTRIBUTION` at them). `witnessed` names `utun7` with `ourTunnelIPv4: 192.168.204.16`, which is the address the `guard` ifconfig stub already prints for `utun7` — that is why no stub changed; `mismatch` is the same name with `10.8.0.3`; `pending` has `ourTunnel: null`, the observer's starting state; `bad-schema` is `schema: 2`. A fifth case, a path that does not exist, is asserted without a file |
 
 #### Why four snapshots share one route table
 
@@ -350,6 +355,44 @@ Each is produced by `sh test/harness/derive-expected.sh <name>` and committed:
 | `cap-exceeded` | `clean` | 300 (over the 256 cap) | 0 | 1 |
 | `dual-default` | `dual-default` | 2 | 4 | 13 |
 | `unspecified-default` | `unspecified-default` | 0 | 0 | 8 |
+| `late-tunnel` | `late-tunnel` | 0 | 0 | 11 |
+| `live-shape` | `live-shape` | 0 | 0 | 9 |
+| `live-shape.stale-en8` | `live-shape.stale-en8` | 0 | 0 | 11 |
+
+The last three sweep **nothing** by construction, and that is what makes them
+usable as scope fixtures: every non-default row in them has a `link#N` gateway or
+is loopback, so the sweep cannot contribute an action and the full ordered action
+list the harness asserts is entirely clauses (a), (b) and (f). What they are
+*about* is therefore a non-sweep assertion, and the enumeration below is the hand
+derivation design.md §7.2 point 4 asks for — every default row, every configd
+key, and which scope admits each.
+
+**`late-tunnel`**, three default rows and eight configd keys (six of them a
+tunnel's):
+
+| Row or key | `.deadPlus(utun7)` | `.deadOnly` |
+|---|---|---|
+| `default 192.168.204.16 UGScg utun7` (unscoped) | deleted, unscoped form | kept — live and witnessed by nothing |
+| `default 100.90.0.1 UGScIg utun0` | kept, `utun0` is live | kept |
+| `default 100.91.0.1 UGScIg utun9` | kept, `utun9` is live | kept |
+| `State:/Network/Service/utun7/{IPv4,DNS}` | removed | kept |
+| `State:/Network/Service/utun0/{IPv4,DNS}` | kept | kept |
+| `State:/Network/Service/utun9/{IPv4,DNS}` | kept | kept |
+| `State:/Network/Service/1111…5555/{IPv4,DNS}` | never matched — the anchored pattern admits `utun` + digits only | as before |
+| clause (f) | installs `en0`: the unscoped slot was freed by `utun7`'s deletion, and `en0` is the only usable physical link | **withheld**, `utun7`'s unscoped default survives |
+
+**`live-shape`**, two default rows and no keys: `utun7`'s unscoped default is
+kept under `.deadOnly` (live, unwitnessed), `en0`'s scoped default is accepted
+but scoped-only so it is never deleted and never counts as a usable default, and
+clause (f) is therefore **withheld** rather than emitted. There is no stale
+physical default in the table, so clause (g) does not fire and records nothing.
+
+**`live-shape.stale-en8`** adds `default 100.64.9.9 UGScIg en8`, which the guard
+rejects as `gatewayOffLink` — `100.64.9.9` is outside both `10.0.1.0/24` and
+`192.168.50.0/24` — so clause (b) classifies it stale and emits its deletion.
+Clause (f) is withheld as above, and clause (g) then withholds that deletion
+too, because its replacement is not being installed. Net effect: no action at
+all, and two kept records saying why.
 
 `dual-default`'s counts are **identical under all four of its snapshots** — both
 stale host routes go via `100.64.9.9`, which is off-link for every link in every

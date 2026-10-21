@@ -222,6 +222,58 @@ STUB_SNAPSHOT=dual-default-en0-absent      # en8 only; en9 and en7 are absent
 check "$(target)" "en8" \
       "case 5  a 0.0.0.0 default on en9 and an -interface default on en7, neither link present: en8"
 
+echo "== Test 8: tunnel_scope — the fail-closed scope, and the shell twin of Suite 12 =="
+# The DECISION only, and it reads two things: a committed attribution record and
+# the stubbed interface snapshot. Nothing here runs route, scutil or the
+# reconcile subcommand.
+#
+# ATTRIBUTION is overridden the same way IFCONFIG/NETSTAT are — by assigning
+# AFTER sourcing, which works because the functions read it at call time. The
+# `guard` snapshot's utun7 is `192.168.204.16`, which is why
+# attribution.witnessed.json carries that address and no stub needed changing.
+STUB_SNAPSHOT=guard
+scope() { tunnel_scope "$(iface_snapshot)" 2>/dev/null; }
+
+ATTRIBUTION="$DIR/fixtures/attribution.witnessed.json"
+check "$(scope)" "deadplus utun7" \
+      "case 19a the record names utun7 and its live address matches: deadplus utun7"
+ATTRIBUTION="$DIR/fixtures/attribution.mismatch.json"
+check "$(scope)" "deadonly" \
+      "case 19b same name, DIFFERENT address: deadonly — a recycled index is not ours"
+ATTRIBUTION="$DIR/fixtures/attribution.pending.json"
+check "$(scope)" "deadonly" \
+      "case 19c ourTunnel null (the observer never resolved): deadonly"
+ATTRIBUTION="$DIR/fixtures/attribution.bad-schema.json"
+check "$(scope)" "deadonly" \
+      "case 19d schema 2: an unrecognised schema NARROWS, never widens"
+ATTRIBUTION="$DIR/fixtures/attribution.does-not-exist.json"
+check "$(scope)" "deadonly" \
+      "case 19e no record at all — post-boot, a failed write, or this transport: deadonly"
+
+# And the state in which the snapshot proves nothing: no usable physical link, so
+# neither "live" nor "dead" can be established and nothing is acted on.
+STUB_SNAPSHOT=lo0-only
+ATTRIBUTION="$DIR/fixtures/attribution.witnessed.json"
+check "$(scope)" "none" \
+      "case 19f lo0 alone: none, even for a record whose witness would match"
+
+# Case 20 — the shell twin of Suite 12 case 12: under deadonly the scope list
+# contains ONLY utuns absent from the snapshot. `utun7` and `utun9` are both in
+# the `guard` snapshot; `utun3` is not.
+STUB_SNAPSHOT=guard
+ATTRIBUTION="$DIR/fixtures/attribution.mismatch.json"
+check "$(tunnels_in_scope "$(iface_snapshot)" deadonly 'utun3 utun7 utun9' 2>/dev/null)" \
+      "utun3" \
+      "case 20a deadonly: only the ABSENT utun3 — utun7 and utun9 are live and spared"
+ATTRIBUTION="$DIR/fixtures/attribution.witnessed.json"
+check "$(tunnels_in_scope "$(iface_snapshot)" 'deadplus utun7' 'utun3 utun7 utun9' \
+            2>/dev/null | tr '\n' ' ')" \
+      "utun3 utun7 " \
+      "case 20b deadplus: the witnessed utun7 as well, and still not utun9"
+check "$(tunnels_in_scope "$(iface_snapshot)" none 'utun3 utun7 utun9' 2>/dev/null)" \
+      "" \
+      "case 20c none: nothing at all, whatever was seen"
+
 echo ""
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

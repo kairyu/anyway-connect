@@ -8,7 +8,9 @@ import Foundation
 // parser, the configd key reduction, the derivation ladder, the reconcile
 // planner, the sweep list, the command formatter, the reconcile gate and the
 // netstate decoder. Suite 13 covers clause (f)'s install-target ladder, added by
-// the defect-3 fix. Suites 10-12 are added by the two fixes that follow.
+// the defect-3 fix. Suites 11 and 12 cover the attribution record and the
+// fail-closed tunnel scope, added by the defect-2 fix. Suite 10 is added by the
+// `stopTunnel` fix that follows.
 //
 // Nothing here touches the live system: no `Process`, no socket, no file outside
 // test/fixtures and test/harness/expected, no window, no NSApp. See
@@ -24,6 +26,8 @@ Suite06Sweep.run()
 Suite07Commands.run()
 Suite08Gate.run()
 Suite09NetState.run()
+Suite11Attribution.run()
+Suite12Scope.run()
 Suite13InstallTarget.run()
 
 H.report()

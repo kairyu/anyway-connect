@@ -51,7 +51,8 @@ D=/tmp/anyway-scratch                      # the FIXED path; the binary is alway
 # file fails here.
 mkdir -p "$D" || exit 1
 fixtures="clean vpn-up carried-home lingering-utun link-down no-default
-          two-physical two-tunnels cap-exceeded dual-default unspecified-default"
+          two-physical two-tunnels cap-exceeded dual-default unspecified-default
+          late-tunnel live-shape live-shape.stale-en8"
 for f in $fixtures; do
     for kind in sweep kept; do
         want="test/harness/expected/$f.$kind.txt"

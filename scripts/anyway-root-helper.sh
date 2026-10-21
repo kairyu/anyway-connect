@@ -59,10 +59,20 @@ LIBEXEC="/usr/local/libexec/anyway-connect"
 ROUTE_WRAPPER="$LIBEXEC/route-wrapper.sh"
 VPNC_SCRIPT="$LIBEXEC/vpnc-script"
 PIDFILE="/var/run/anyway-connect.pid"
-# Written by the privileged daemon before a connect, removed by its stopTunnel.
-# `reconcile` READS one field of it (preexistingTunnels) and never writes or
-# removes it: every later reconcile in this boot needs that tunnel scope.
-NETSTATE="/var/run/anyway-connect.netstate.json"
+# WHO OUR TUNNEL IS, written by the privileged daemon: the interface name its
+# observer saw after openconnect created it, and the IPv4 address that interface
+# was carrying. This arm READS it and never writes or removes it — the `tunnel`
+# subcommand below `exec`s openconnect with nothing after it, so there is nobody
+# left to observe an interface, and a record this arm wrote could only ever say
+# `ourTunnel: null`, which is exactly equivalent to no record at all.
+#
+# Its absence is the fail-closed state: reconcile then acts only on tunnels that
+# are absent from the interface snapshot. The netstate
+# (/var/run/anyway-connect.netstate.json) is deliberately NOT read here any
+# more: its `preexistingTunnels` was a connect-time list of somebody else's
+# tunnels, and a clean stop deletes it, so the protection it was supposed to give
+# evaporated on the one path that reaches a reconcile.
+ATTRIBUTION="/var/run/anyway-connect.tunnels.json"
 
 die() { echo "anyway-root-helper: $*" >&2; exit 2; }
 
@@ -553,38 +563,120 @@ live_tunnel_pid() {
     esac
 }
 
-# The netstate's preexistingTunnels — the tunnels that were already up when we
-# connected, i.e. somebody else's. One awk extraction of that one array of simple
-# strings; ANY parse difficulty is treated as "netstate absent" (return 1) and
-# said so on stderr, which is the widened, requirement-literal behaviour of
-# acting on every utun (open issue O-9).
-netstate_preexisting_tunnels() {
-    [ -r "$NETSTATE" ] || return 1
-    # NetState.maxBytes. A file larger than this is not our netstate.
-    _ns_sz="$(wc -c < "$NETSTATE" 2>/dev/null | tr -d ' ')"
-    case "${_ns_sz:-}" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$_ns_sz" -le 65536 ] || return 1
-    awk '
+# attribution_field NAME — one field of the attribution record, or nothing.
+#
+# NAME is `ourTunnel` or `ourTunnelIPv4`; those are the only two fields this arm
+# reads, and NEITHER IS A DATE. That is the whole of the cross-implementation
+# contract here: the Swift side writes ISO-8601 dates that this reader never
+# looks at, so there is no date format for the two implementations to disagree
+# about.
+#
+# One defensive awk extraction, in the same style as the netstate parser it
+# replaces: readable, under NetState/TunnelAttribution.maxBytes, `schema`
+# exactly 1, and the value matching the SAME pattern the Swift decoder applies
+# (`^utun[0-9]{1,3}$` for the name, a strict dotted quad for the address). ANY
+# parse difficulty prints nothing and returns 1, which the caller reads as
+# "absent" — i.e. dead-only, never a wider scope.
+attribution_field() {
+    [ -n "${1:-}" ] || return 1
+    [ -r "$ATTRIBUTION" ] || return 1
+    _af_sz="$(wc -c < "$ATTRIBUTION" 2>/dev/null | tr -d ' ')"
+    case "${_af_sz:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_af_sz" -le 65536 ] || return 1
+    awk -v want="$1" '
+        function value(all, key,   i, rest, q2) {
+            i = index(all, "\"" key "\":")
+            if (i == 0) return "\004"                  # absent
+            rest = substr(all, i + length(key) + 3)
+            sub(/^[ \t]+/, "", rest)
+            if (substr(rest, 1, 1) != "\"") return "\004"   # null, or not a string
+            rest = substr(rest, 2)
+            q2 = index(rest, "\"")
+            if (q2 == 0) return "\004"
+            return substr(rest, 1, q2 - 1)
+        }
         { all = all $0 }
         END {
-            i = index(all, "\"preexistingTunnels\"")
-            if (i == 0) exit 1
-            rest = substr(all, i)
-            o = index(rest, "["); c = index(rest, "]")
-            if (o == 0 || c == 0 || c < o) exit 1
-            body = substr(rest, o + 1, c - o - 1)
-            gsub(/[ \t"]/, "", body)
-            n = split(body, t, ",")
-            for (j = 1; j <= n; j++) {
-                if (t[j] == "") continue
-                # Only plain utun names. Anything else means this is not the
-                # array we think it is, and guessing would scope a privileged
-                # deletion by a value we misread.
-                if (t[j] !~ /^utun[0-9][0-9]?[0-9]?$/) exit 1
-                print t[j]
-            }
+            # An unrecognised schema NARROWS, exactly as the Swift decoder does:
+            # a future writer may mean something different by the same names.
+            gsub(/[ \t]/, "", all)
+            if (index(all, "\"schema\":1") == 0) exit 1
+            v = value(all, want)
+            if (v == "\004" || v == "") exit 1
+            if (want == "ourTunnel") {
+                if (v !~ /^utun[0-9][0-9]?[0-9]?$/) exit 1
+            } else if (want == "ourTunnelIPv4") {
+                # The strictness the guard itself uses: four octets, each 0-255,
+                # no leading zeros — so 010.0.1.1 is refused here too.
+                if (v !~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/) exit 1
+                n = split(v, o, ".")
+                for (i = 1; i <= n; i++) {
+                    if (o[i] + 0 > 255) exit 1
+                    if (length(o[i]) > 1 && substr(o[i], 1, 1) == "0") exit 1
+                }
+            } else exit 1
+            print v
         }
-    ' "$NETSTATE" 2>/dev/null
+    ' "$ATTRIBUTION" 2>/dev/null
+}
+
+# tunnel_scope SNAPSHOT — which tunnels reconcile may act on, as one word:
+#
+#   none             the snapshot proves nothing (no usable physical link in it),
+#                    so neither "live" nor "dead" can be established: act on
+#                    nothing;
+#   deadonly         act only on tunnels ABSENT from the snapshot;
+#   deadplus <utun>  act on those, PLUS this live one, which the record names as
+#                    ours and whose live address equals the recorded witness.
+#
+# The same rule as NetReconcile.tunnelScope, and the witness check is the point
+# of it: the gate above has already proved no openconnect of ours is running, so
+# a live `utun7` the record names is at least as likely to be a recycled index as
+# our own lingering interface. Only the address we recorded tells them apart.
+#
+# Both halves are answerable from iface_snapshot, which carries name, up,
+# POINTOPOINT, loopback and `addr/mask` columns.
+tunnel_scope() {
+    _ts_snap="$1"
+    [ -n "$(physical_links "$_ts_snap")" ] || { echo none; return 0; }
+    _ts_ours="$(attribution_field ourTunnel)" || { echo deadonly; return 0; }
+    _ts_witness="$(attribution_field ourTunnelIPv4)" || { echo deadonly; return 0; }
+    # Live, and carrying the address we recorded for it?
+    _ts_live="$(printf '%s\n' "$_ts_snap" | awk -v n="$_ts_ours" -v w="$_ts_witness" '
+        $1 != n { next }
+        { for (i = 5; i <= NF; i++) { split($i, a, "/"); if (a[1] == w) { print "yes"; exit } } }
+    ')"
+    if [ "${_ts_live:-}" = "yes" ]; then
+        echo "deadplus $_ts_ours"
+    else
+        echo deadonly
+    fi
+}
+
+# tunnels_in_scope SNAPSHOT SCOPE SEEN — of the tunnels in SEEN, the ones
+# reconcile may act on under SCOPE, one per line. Every tunnel it declines is
+# said out loud on stderr.
+#
+# A function rather than an inline loop so test/test-onlink-guard.sh can assert
+# the list directly: "a live tunnel is never acted on unless it is the witnessed
+# one" is the whole of the protection, and it should be a test rather than a
+# reading of the reconcile arm.
+tunnels_in_scope() {
+    _ti_snap="$1"; _ti_scope="$2"; _ti_seen="$3"
+    [ "$_ti_scope" != "none" ] || return 0
+    _ti_ours=""
+    case "$_ti_scope" in deadplus*) _ti_ours="${_ti_scope#deadplus }" ;; esac
+    for _ti_t in $_ti_seen; do
+        [ -n "$_ti_t" ] || continue
+        if [ "$_ti_t" = "$_ti_ours" ]; then
+            echo "$_ti_t"
+        elif printf '%s\n' "$_ti_snap" \
+                | awk -v n="$_ti_t" '$1 == n { f = 1 } END { exit(f ? 0 : 1) }'; then
+            echo "left live tunnel $_ti_t alone (not witnessed as ours)" >&2
+        else
+            echo "$_ti_t"
+        fi
+    done
 }
 
 # The configd keys that hold a tunnel's IPv4 and DNS overrides, as bare keys.
@@ -650,7 +742,8 @@ preferred_install_target() {
 # apply time while a healthy `en8` was never considered.
 #
 # Swift's step (1), netstate.physicalInterface, is not available here: this arm
-# reads only preexistingTunnels from the netstate (O-6). With two or more live
+# does not read the netstate at all (O-6) — the only state file it reads is the
+# attribution record, and only for the tunnel scope. With two or more live
 # physical links and no default row to inherit a netif from, NOTHING is chosen
 # and that is said out loud — picking one at random is how you install a default
 # onto the wrong network.
@@ -933,32 +1026,38 @@ case "$CMD" in
         KEYS="$(configd_tunnel_keys)"
 
         # The tunnel scope, shared by the configd removals and the default-route
-        # deletion: every tunnel we can see, minus the ones that were already up
-        # when we connected. Without the subtraction a launch- or wake-time
-        # reconcile on a machine also running Tailscale, Zscaler or a
-        # profile-installed IKEv2 tunnel would dismantle that product's routing
-        # and resolver configuration every time this app starts.
-        if PRE="$(netstate_preexisting_tunnels)"; then
-            :
-        else
-            PRE=""
-            echo "netstate absent or unparsable — acting on every tunnel seen" >&2
-        fi
+        # deletion, and derived from LIVENESS rather than from a list: a tunnel
+        # is acted on only when its interface is absent from a usable snapshot —
+        # provably dead, so nothing running owns it — or when the attribution
+        # record names it as ours AND its live address equals the address the
+        # daemon recorded for it.
+        #
+        # What this replaces was fail-open in a privileged delete: with the
+        # netstate missing, which is exactly what a clean disconnect leaves
+        # behind, the old block acted on every tunnel it could see. On a machine
+        # also running Tailscale, Zscaler or a profile-installed IKEv2 tunnel that
+        # dismantled the other product's routing and resolver configuration every
+        # time this app started.
+        SCOPE="$(tunnel_scope "$SNAP")"
+        OURS=""
+        case "$SCOPE" in
+            none)
+                echo "no usable physical link in the interface snapshot — acting on"\
+                     "no tunnel at all" >&2 ;;
+            deadplus*)
+                OURS="${SCOPE#deadplus }"
+                echo "witnessed tunnel of ours: $OURS — acting on it and on tunnels"\
+                     "absent from the interface snapshot" >&2 ;;
+            *)
+                echo "no witnessed tunnel of ours — acting only on tunnels absent from"\
+                     "the interface snapshot" >&2 ;;
+        esac
         SEEN="$( { printf '%s\n' "$SNAP" | awk '
                       ($3 == 1) || ($1 ~ /^(utun|ppp|ipsec|gif|stf)/) { print $1 }'
                    default_rows "$TABLE" | awk '$1 ~ /^utun[0-9][0-9]?[0-9]?$/ { print $1 }'
                    printf '%s\n' "$KEYS" | awk -F/ 'NF >= 5 { print $4 }'
                  } | sort -u | grep -v '^$' || true)"
-        INSCOPE=""
-        for _rc_t in $SEEN; do
-            _rc_foreign=0
-            for _rc_f in $PRE; do [ "$_rc_t" = "$_rc_f" ] && _rc_foreign=1; done
-            if [ "$_rc_foreign" = "1" ]; then
-                echo "left foreign tunnel $_rc_t alone (it predates our connect)" >&2
-            else
-                INSCOPE="$INSCOPE $_rc_t"
-            fi
-        done
+        INSCOPE="$(tunnels_in_scope "$SNAP" "$SCOPE" "$SEEN")"
 
         # 1. configd first, so DNS comes back. IPv4 before DNS per tunnel,
         #    ascending by name — the same order the vendored vpnc-script uses in

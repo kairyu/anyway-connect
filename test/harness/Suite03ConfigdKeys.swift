@@ -2,9 +2,8 @@ import Foundation
 
 // Suite 3 — the configd key reduction and `matchConfigdKey`.
 //
-// `matchConfigdKey` (NetReconcile.swift:839-847) is `private static`, and this
-// feature changes no production source, so it is driven through the ONE
-// observable it feeds: clause (a) of `plan`, which emits one
+// `matchConfigdKey` (NetReconcile.swift) is `private static`, so it is driven
+// through the ONE observable it feeds: clause (a) of `plan`, which emits one
 // `.removeConfigdKey` per key it matches. The route table is deliberately empty
 // so clause (d′) aborts — the configd removals are appended BEFORE the abort
 // check, precisely because they derive solely from the scutil key list and need
@@ -12,16 +11,29 @@ import Foundation
 // single most valuable thing the daemon can do, so this is the behaviour worth
 // pinning.
 //
+// The snapshot below is ONE USABLE PHYSICAL LINK and no tunnel, which is this
+// suite's minimum input rather than a detail: the tunnel scope acts on a tunnel
+// only when it is absent from a snapshot that is itself usable, so an EMPTY
+// snapshot — which this suite used to pass — now means `.none` and no removals
+// at all. That is the fail-closed direction and it is asserted in its own right
+// at the end of this suite, and in Suite 5's (d″) case and Suite 12's case 17.
+//
 // The anchoring matters more than it looks: on a real machine the UUID-named
 // service IS the resolver configuration. A pattern that matched it would have
 // reconcile delete the machine's own DNS.
 
 enum Suite03ConfigdKeys {
 
+    /// One usable physical link, no tunnel: every `utunN` a key names is
+    /// therefore absent from a usable snapshot, i.e. provably dead and in scope.
+    private static let liveEn0 = [oneAddress("lo0", "127.0.0.1", 8, loopback: true),
+                                  oneAddress("en0", "10.0.1.22", 24)]
+
     /// Every key this suite offers is emitted as a removal if, and only if,
     /// `matchConfigdKey` accepts it.
     private static func removals(_ keys: [String]) -> [String] {
-        NetReconcile.plan(routeTable: "", interfaces: [], configdKeys: keys, netstate: nil)
+        NetReconcile.plan(routeTable: "", interfaces: liveEn0, configdKeys: keys,
+                          netstate: nil, attribution: nil)
             .actions.compactMap {
                 if case .removeConfigdKey(let k) = $0 { return k } else { return nil }
             }
@@ -100,10 +112,22 @@ enum Suite03ConfigdKeys {
 
         // ── And the contract this suite leans on: the removals survive the
         // fail-closed abort.
-        let p = NetReconcile.plan(routeTable: "", interfaces: [],
+        let p = NetReconcile.plan(routeTable: "", interfaces: liveEn0,
                                   configdKeys: ["State:/Network/Service/utun7/DNS"],
-                                  netstate: nil)
+                                  netstate: nil, attribution: nil)
         H.eq(p.abort, .routeTableUnreadable, "an unreadable table aborts")
         H.eq(p.actions.count, 1, "and the configd removal is retained anyway")
+
+        // ── The OTHER fail-closed abort does not retain it, and that asymmetry
+        // is deliberate: with no usable interface in the snapshot we cannot see
+        // whether a third party is live, and the key we would remove is
+        // somebody's resolver configuration.
+        let blind = NetReconcile.plan(routeTable: "", interfaces: [],
+                                      configdKeys: ["State:/Network/Service/utun7/DNS"],
+                                      netstate: nil, attribution: nil)
+        H.eq(blind.abort, .routeTableUnreadable,
+             "an unreadable table is still reported first")
+        H.eqList(blind.actions, [],
+                 "but with NO usable interface the removal is not emitted at all")
     }
 }

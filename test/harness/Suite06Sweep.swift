@@ -23,10 +23,13 @@ enum Suite06Sweep {
 
     private static func sweepArgv(_ fixture: String, interfaces: String? = nil,
                                   configdKeys: [String] = []) -> [String] {
+        // No attribution and no netstate: the sweep is not attribution-scoped at
+        // all — its rule is on-link-ness — so the scope cannot move these lists,
+        // and asserting them under the narrowest scope says so.
         let plan = NetReconcile.plan(routeTable: Fixtures.routeTable(fixture),
                                      interfaces: Fixtures.interfaces(interfaces ?? fixture),
                                      configdKeys: configdKeys,
-                                     netstate: nil)
+                                     netstate: nil, attribution: nil)
         return NetReconcile.commands(for: plan).sweep.map(argvLine)
     }
 

@@ -546,11 +546,13 @@ public enum NetProbe {
     /// `targetInterfaceUnconfigured` (FR-1.2b) if an IPv4-less link is PRESENT
     /// with `ipv4 == nil` — and since the fixtures are hand-written JSON, an
     /// AF_INET-only collector would disagree with them while every suite passed.
-    /// (2) §4.3(a)'s tunnel scope reads `isTunnelLike` interfaces out of this
-    /// snapshot, and `utun0…utun6`, `gif0` and `stf0` on the target machine are
-    /// up, POINTOPOINT and IPv6-only: under an AF_INET-only collector
-    /// `preexistingTunnels` is empty there and every third-party tunnel falls
-    /// into reconcile's scope.
+    /// (2) the reconcile's tunnel scope decides which tunnels are LIVE out of
+    /// this snapshot, and `utun0…utun6`, `gif0` and `stf0` on the target machine
+    /// are up, POINTOPOINT and IPv6-only: under an AF_INET-only collector they
+    /// would be missing from it, be read as "absent, therefore provably dead",
+    /// and every one of them would fall into reconcile's scope. (This clause used
+    /// to be stated in terms of `NetState.preexistingTunnels`, which the planner
+    /// no longer reads — the hazard is the same one and now bears on liveness.)
     ///
     /// A `getifaddrs` failure yields `[]`. For `restoreDefaultRoute` that is the
     /// safe direction (every guard evaluation then rejects

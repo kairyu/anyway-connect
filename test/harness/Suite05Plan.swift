@@ -73,10 +73,15 @@ enum Suite05Plan {
         }
     }
 
+    /// `attribution` defaults to `nil` HERE, in the harness, because that is the
+    /// answer most of these fixtures are about: a plan with no identity claim,
+    /// which is dead-only. `NetReconcile.plan` itself takes no default, so the
+    /// daemon cannot reach that state by omission.
     private static func check(_ fixture: String,
                               interfaces interfacesName: String? = nil,
                               configdKeys: [String] = [],
                               netstate: NetState? = nil,
+                              attribution: TunnelAttribution? = nil,
                               label: String,
                               actions: [ReconcileAction],
                               abort: ReconcileAbort? = nil,
@@ -86,7 +91,8 @@ enum Suite05Plan {
             routeTable: Fixtures.routeTable(fixture),
             interfaces: Fixtures.interfaces(interfacesName ?? fixture),
             configdKeys: configdKeys,
-            netstate: netstate)
+            netstate: netstate,
+            attribution: attribution)
         H.eqList(plan.actions, actions, "\(label): actions")
         H.eq(plan.abort, abort, "\(label): abort")
         H.eqList(plan.kept, kept, "\(label): kept")
@@ -140,43 +146,45 @@ enum Suite05Plan {
         // The two routes via its LIVE address are kept (FR-2.6c: the gateway is
         // on-link for a live interface), and the two via the vanished utun8
         // address are swept — the kept case and the swept case of the same shape.
-        check("lingering-utun", label: "lingering-utun",
-              actions: [.deleteTunnelDefaultRoute(netif: "utun7", ifscoped: true)]
-                  + sweepFromFixture("lingering-utun"),
-              kept: [.widenedToAllTunnels(["utun7", "utun8"]),
-                     .physicalDefaultUsable(netif: "en0")]
+        //
+        // With NO identity claim, the live utun7 is out of scope and its default
+        // route is left alone: the only tunnel acted on is the vanished `utun8`,
+        // which has no default row of its own. Suite 12 case 15 drives the same
+        // fixture with the witness, where utun7's default IS deleted.
+        check("lingering-utun", label: "lingering-utun (no attribution)",
+              actions: sweepFromFixture("lingering-utun"),
+              kept: [.foreignTunnel("utun7"),
+                     .physicalDefaultUsable(netif: "en0"),
+                     .foreignTunnel("utun7")]
                   + keptFromFixture("lingering-utun"))
 
-        // ── two-tunnels, no netstate: FR-2.4/FR-2.5 as written, i.e. every
-        // utun. Recorded as `widenedToAllTunnels` because of what it can
-        // dismantle on a machine also running a third-party VPN.
+        // ── two-tunnels, no identity claim: both utuns are LIVE, so neither is
+        // in scope and the plan is empty. The install is withheld too — utun7's
+        // unscoped default survives, so `route add default` could only EEXIST.
         check("two-tunnels", configdKeys: Fixtures.scutilKeys("two-tunnels"),
-              label: "two-tunnels (no netstate)",
-              actions: [.removeConfigdKey("State:/Network/Service/utun0/IPv4"),
-                        .removeConfigdKey("State:/Network/Service/utun0/DNS"),
-                        .removeConfigdKey("State:/Network/Service/utun7/IPv4"),
-                        .removeConfigdKey("State:/Network/Service/utun7/DNS"),
-                        .deleteTunnelDefaultRoute(netif: "utun7", ifscoped: false),
-                        .deleteTunnelDefaultRoute(netif: "utun0", ifscoped: true),
-                        .installDefaultRoute(interface: "en0")],
-              kept: [.widenedToAllTunnels(["utun0", "utun7"])]
-                  + keptFromFixture("two-tunnels"),
-              note: "routeTable none; netstateAdvisory none")
+              label: "two-tunnels (no attribution)",
+              actions: [],
+              kept: [.foreignTunnel("utun0"), .foreignTunnel("utun7"),
+                     .foreignTunnel("utun7"), .foreignTunnel("utun0")]
+                  + keptFromFixture("two-tunnels")
+                  + [.installWithheldForSurvivingDefault(netif: "utun7")])
 
-        // ── two-tunnels WITH a netstate naming utun0 as somebody else's. THE
-        // DISCRIMINATION TEST: no action names utun0 — not its default route,
-        // not either of its configd keys — and it appears in `kept` instead.
-        // Twice, because the scope derivation and clause (b) each record it.
+        // ── two-tunnels WITH an attribution record naming utun7 as ours and
+        // witnessing its address. THE DISCRIMINATION TEST: no action names utun0
+        // — not its default route, not either of its configd keys — and it
+        // appears in `kept` instead. Twice, because the scope derivation and
+        // clause (b) each record it.
         check("two-tunnels", configdKeys: Fixtures.scutilKeys("two-tunnels"),
-              netstate: Suite04Derivation.netstate(tunnels: ["utun0"]),
-              label: "two-tunnels (utun0 is foreign)",
+              attribution: Suite11Attribution.attr(ourTunnel: "utun7",
+                                                   ourTunnelIPv4: "192.168.204.16"),
+              label: "two-tunnels (utun7 is ours and witnessed)",
               actions: [.removeConfigdKey("State:/Network/Service/utun7/IPv4"),
                         .removeConfigdKey("State:/Network/Service/utun7/DNS"),
                         .deleteTunnelDefaultRoute(netif: "utun7", ifscoped: false),
                         .installDefaultRoute(interface: "en0")],
               kept: [.foreignTunnel("utun0"), .foreignTunnel("utun0")]
                   + keptFromFixture("two-tunnels"),
-              note: "routeTable none; netstateAdvisory 192.168.1.1")
+              note: "routeTable none; netstateAdvisory none")
 
         // ── carried-home: THE REPORTED INCIDENT. The surviving
         // `default 10.0.1.1 UGScIg en0` row is the blackhole; utun7 is gone from
@@ -189,26 +197,34 @@ enum Suite05Plan {
                                                          reason: .gatewayOffLink)]
                   + sweepFromFixture("carried-home")
                   + [.installDefaultRoute(interface: "en0")],
-              kept: [.widenedToAllTunnels(["gif0", "stf0", "utun0", "utun1", "utun2",
-                                           "utun7"])]
+              kept: [.foreignTunnel("gif0"), .foreignTunnel("stf0"),
+                     .foreignTunnel("utun0"), .foreignTunnel("utun1"),
+                     .foreignTunnel("utun2")]
                   + keptFromFixture("carried-home"),
               note: "routeTable 10.0.1.1; netstateAdvisory none")
 
         // ── vpn-up: the SAME table on the office LAN. Nothing is swept, because
         // every gateway in it is reachable — 10.0.1.1 is on-link for en0,
         // 10.0.1.22 is en0's own address, and 192.168.204.16 is held by a LIVE
-        // utun7. The en0 default is scoped-only, so it is kept and (f) still
-        // installs the unscoped form. This is the live machine's actual shape.
-        check("vpn-up", configdKeys: Fixtures.scutilKeys("vpn-up"), label: "vpn-up",
-              actions: [.removeConfigdKey("State:/Network/Service/utun7/IPv4"),
-                        .removeConfigdKey("State:/Network/Service/utun7/DNS"),
-                        .deleteTunnelDefaultRoute(netif: "utun7", ifscoped: false),
-                        .installDefaultRoute(interface: "en0")],
-              kept: [.widenedToAllTunnels(["gif0", "stf0", "utun0", "utun1", "utun2",
-                                           "utun3", "utun4", "utun5", "utun6", "utun7"]),
+        // utun7. The en0 default is scoped-only, so it is kept.
+        //
+        // With no identity claim every one of the ten tunnels is live and out of
+        // scope, so the plan is empty and the install is withheld: utun7's
+        // unscoped default is still the kernel's answer for `default`. Suite 12
+        // case 18 drives the same fixture with the witness, which reproduces
+        // today's plan exactly.
+        check("vpn-up", configdKeys: Fixtures.scutilKeys("vpn-up"),
+              label: "vpn-up (no attribution)",
+              actions: [],
+              kept: [.foreignTunnel("gif0"), .foreignTunnel("stf0"),
+                     .foreignTunnel("utun0"), .foreignTunnel("utun1"),
+                     .foreignTunnel("utun2"), .foreignTunnel("utun3"),
+                     .foreignTunnel("utun4"), .foreignTunnel("utun5"),
+                     .foreignTunnel("utun6"), .foreignTunnel("utun7"),
+                     .foreignTunnel("utun7"),
                      .physicalDefaultUnusable(netif: "en0", why: "ifscope-only")]
-                  + keptFromFixture("vpn-up"),
-              note: "routeTable 10.0.1.1; netstateAdvisory none")
+                  + keptFromFixture("vpn-up")
+                  + [.installWithheldForSurvivingDefault(netif: "utun7")])
 
         // ── cap-exceeded: 300 distinct destinations via a dead gateway. The
         // SWEEP aborts, not the whole reconcile — clearing the DNS hijack,
@@ -226,28 +242,43 @@ enum Suite05Plan {
         H.eq(NetReconcile.sweepCap, 256, "the cap bounds DISTINCT destinations at 256")
 
         // ── (d′) and (d″): the two fail-closed aborts. Both suppress (b), (c)
-        // and (f) and both RETAIN (a), and they are distinct cases because the
-        // transcript has to name which input failed.
+        // and (f), and they are distinct cases because the transcript has to name
+        // which input failed. They now differ in what they retain, and the
+        // asymmetry is the decided part:
+        //
+        //   * (d′) RETAINS (a). The configd removals derive solely from the
+        //     scutil key list and need no route table at all, and on a wedged
+        //     machine clearing the DNS override is the most valuable thing we can
+        //     do. The interface snapshot is readable here, so `dead` is real.
+        //   * (d″) RETAINS NOTHING, because the scope is `.none`: with no
+        //     readable interface list we cannot see whether a third party is
+        //     live, and the key we would remove is somebody's resolver
+        //     configuration.
         var p = NetReconcile.plan(routeTable: "not a route table",
                                   interfaces: Fixtures.interfaces("clean"),
                                   configdKeys: ["State:/Network/Service/utun7/DNS"],
-                                  netstate: nil)
+                                  netstate: nil, attribution: nil)
         H.eq(p.abort, .routeTableUnreadable, "(d′) an unreadable table")
         H.eqList(p.actions, [.removeConfigdKey("State:/Network/Service/utun7/DNS")],
-                 "(d′) retains the configd removals and emits nothing else")
+                 "(d′) retains the configd removals — utun7 is absent from a USABLE "
+               + "snapshot, so it is dead and its key configures nothing")
 
         p = NetReconcile.plan(routeTable: Fixtures.routeTable("carried-home"),
                               interfaces: [oneAddress("lo0", "127.0.0.1", 8,
                                                       loopback: true)],
                               configdKeys: ["State:/Network/Service/utun7/DNS"],
-                              netstate: nil)
+                              netstate: nil, attribution: nil)
         H.eq(p.abort, .interfaceSnapshotUnusable,
              "(d″) lo0 alone is not a usable snapshot — otherwise (d″) is unreachable")
-        H.eqList(p.actions, [.removeConfigdKey("State:/Network/Service/utun7/DNS")],
-                 "(d″) sweeps nothing, deletes no default, installs nothing")
+        H.eqList(p.actions, [],
+                 "(d″) sweeps nothing, deletes no default, installs nothing — AND "
+               + "emits no configd removal either")
+        H.eqList(p.kept, [.foreignTunnel("utun7")],
+                 "(d″) every tunnel it saw is recorded as out of scope")
 
         p = NetReconcile.plan(routeTable: Fixtures.routeTable("carried-home"),
-                              interfaces: [], configdKeys: [], netstate: nil)
+                              interfaces: [], configdKeys: [], netstate: nil,
+                              attribution: nil)
         H.eq(p.abort, .interfaceSnapshotUnusable,
              "(d″) an empty snapshot: a failed getifaddrs is not evidence of dead routes")
 
@@ -269,7 +300,8 @@ enum Suite05Plan {
                         oneAddress("en0", "192.168.1.42", 24),
                         oneAddress("en1", "192.168.2.42", 24)]
         p = NetReconcile.plan(routeTable: header + "\ndefault 0.0.0.0 UGScg en9",
-                              interfaces: twoLinks, configdKeys: [], netstate: nil)
+                              interfaces: twoLinks, configdKeys: [], netstate: nil,
+                              attribution: nil)
         H.eqList(p.actions, [],
                  "rung 2 no longer offers the ABSENT en9, so nothing is deleted either")
         H.eqList(p.kept, [.ambiguousInstallTarget(["en0", "en1"]),
@@ -283,7 +315,8 @@ enum Suite05Plan {
                               interfaces: twoLinks, configdKeys: [],
                               netstate: Suite04Derivation.netstate(interface: "en1",
                                                                    subnet: "192.168.2.0/24",
-                                                                   advisory: "192.168.2.1"))
+                                                                   advisory: "192.168.2.1"),
+                              attribution: nil)
         H.eqList(p.actions,
                  [.deleteStalePhysicalDefaultRoute(netif: "en9", ifscoped: false,
                                                    reason: .unspecifiedGateway),

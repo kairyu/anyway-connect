@@ -21,7 +21,7 @@ enum Suite07Commands {
             routeTable: Fixtures.routeTable(fixture),
             interfaces: Fixtures.interfaces(interfaces ?? fixture),
             configdKeys: configdKeys,
-            netstate: nil))
+            netstate: nil, attribution: nil))
     }
 
     static func run() {
@@ -49,7 +49,17 @@ enum Suite07Commands {
         // wrong one. A `-ifscope`d row is deleted by name, which is unambiguous;
         // an unscoped row is deleted only while the current default still IS
         // that interface.
-        let twoTunnels = commands("two-tunnels",
+        //
+        // Paired with `interfaces.clean.json` rather than with its own snapshot,
+        // because this case needs BOTH tunnel deletions in ONE plan and the
+        // tunnel scope only reaches a live tunnel for the single witnessed one.
+        // `clean` holds `en0` and no tunnel at all, so `utun0` and `utun7` are
+        // both absent from a usable snapshot — provably dead, nothing running
+        // owns either — which is the state in which this split is observable.
+        // The route table, the keys and therefore every expectation below are
+        // unchanged by the pairing: `clean`'s `en0` is `192.168.1.42/24`, the
+        // same subnet as the table's on-link rows.
+        let twoTunnels = commands("two-tunnels", interfaces: "clean",
                                   configdKeys: Fixtures.scutilKeys("two-tunnels"))
         H.eqList(Array(twoTunnels.prologue.dropFirst()),
                  [.deleteUnscopedDefaultWhileInterface(netif: "utun7", maxIterations: 8),

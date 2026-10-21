@@ -41,7 +41,8 @@ enum Suite13InstallTarget {
             routeTable: Fixtures.routeTable(fixture),
             interfaces: Fixtures.interfaces(interfacesName ?? fixture),
             configdKeys: configdKeys,
-            netstate: netstate)
+            netstate: netstate,
+            attribution: nil)
         H.eqList(plan.actions, actions, "\(label): actions")
         H.eqList(plan.kept, kept, "\(label): kept")
         H.eq(plan.abort, nil, "\(label): nothing aborts")
@@ -117,18 +118,29 @@ enum Suite13InstallTarget {
         // where the comment this change corrected was wrong. `0.0.0.0` on en9 is
         // `unspecifiedGateway` (step 3) and `link#7` on en7 is `malformedGateway`
         // (step 2); both are returned BEFORE the interface lookup, so neither
-        // link has to exist — and neither does. Four things are asserted at once:
-        // en8 is chosen, en9's deletion is still emitted because clause (b) is
-        // unchanged, en7 gets no deletion at all, and clause (g) records NO
-        // withholding because an install was emitted beside the deletion.
+        // link has to exist — and neither does.
+        //
+        // THE ANSWER MOVED when clause (f) gained its postcondition precondition,
+        // and this is the one existing expectation that moved with it. The `en7`
+        // row is UNSCOPED and is KEPT ("no IPv4 next hop"), so after `en9`'s
+        // deletion the kernel would still answer `default` with it and
+        // `route -n add default 192.168.1.1` could only return EEXIST. The
+        // install is therefore withheld rather than emitted and reported as done,
+        // and clause (g) then withholds `en9`'s deletion too, because its
+        // replacement is not being installed. Nothing is deleted, nothing is
+        // installed, and both decisions are recorded — which is the honest answer
+        // to a table holding two unscoped defaults, a shape the fixture is
+        // synthetic precisely because a real kernel does not hold it.
+        //
+        // The ladder itself is unchanged and still answers `en8` when it is
+        // asked, which case 9 below asserts directly from literals.
         check("unspecified-default", label: "unspecified-default",
-              actions: [.deleteStalePhysicalDefaultRoute(netif: "en9", ifscoped: false,
-                                                         reason: .unspecifiedGateway),
-                        .installDefaultRoute(interface: "en8")],
+              actions: [],
               kept: [.physicalDefaultUnusable(netif: "en7", why: "no IPv4 next hop"),
                      .physicalDefaultUnusable(netif: "en8", why: "ifscope-only")]
-                  + Suite05Plan.keptFromFixture("unspecified-default"),
-              note: "routeTable 192.168.1.1; netstateAdvisory none")
+                  + Suite05Plan.keptFromFixture("unspecified-default")
+                  + [.installWithheldForSurvivingDefault(netif: "en7"),
+                     .defaultDeletionsWithheld(netifs: ["en9"])])
 
         // ── case 7: rungs 4 and 5 are untouched by this change, so the
         // dual-homed state with NO default row at all still refuses to guess.
@@ -144,16 +156,25 @@ enum Suite13InstallTarget {
         // one list a mistake in the ladder could plausibly disturb.
         let home = NetReconcile.plan(routeTable: Fixtures.routeTable("carried-home"),
                                      interfaces: Fixtures.interfaces("carried-home"),
-                                     configdKeys: [], netstate: nil)
+                                     configdKeys: [], netstate: nil, attribution: nil)
         H.ok(home.actions.contains(.installDefaultRoute(interface: "en0")),
              "carried-home still installs en0")
         H.eqList(NetReconcile.commands(for: home).sweep.map(argvLine),
                  Fixtures.expected("carried-home.sweep.txt"),
                  "carried-home's 236 deletions are element-for-element unchanged")
+        // vpn-up's install needs the witness now: with its utun7 live and
+        // unattributed, the unscoped default it holds is the kernel's answer for
+        // `default` and the install is withheld. Under `.deadPlus` the tunnel
+        // default is deleted first, so the slot is free and the LADDER's answer
+        // — en0, the only usable physical link — is unchanged, which is what this
+        // case is here to re-assert.
         let office = NetReconcile.plan(routeTable: Fixtures.routeTable("vpn-up"),
                                        interfaces: Fixtures.interfaces("vpn-up"),
                                        configdKeys: Fixtures.scutilKeys("vpn-up"),
-                                       netstate: nil)
+                                       netstate: nil,
+                                       attribution: Suite11Attribution.attr(
+                                           ourTunnel: "utun7",
+                                           ourTunnelIPv4: "192.168.204.16"))
         H.ok(office.actions.contains(.installDefaultRoute(interface: "en0")),
              "vpn-up still installs en0")
         H.eqList(NetReconcile.commands(for: office).sweep.map(argvLine), [],

@@ -104,12 +104,13 @@ All four are enforced by the runner's gates rather than trusted.
    config — which has caused data loss twice. `AppConfig` is exercised by
    decoding literal JSON if it is exercised at all, and nothing here reads or
    echoes that file: it holds credentials.
-2. **No suite opens a real `/var/run` path.** `NetState.load` takes `path:` with
-   a default, and reaching for the default would read a root-owned live file on
-   the developer's machine. Suite 9 drives `decode(_:)` from literal `Data`,
-   which is why the state-file path constants are in the forbidden list.
-3. **No suite instantiates a window or calls `NSApp`.** Suites 1-9 are
-   pure-function tests, so the rule is vacuous today. If one ever needs a window
+2. **No suite opens a real `/var/run` path.** `NetState.load` and
+   `TunnelAttribution.load` both take `path:` with a default, and reaching for
+   either default would read a root-owned live file on the developer's machine.
+   Suites 9 and 11 drive `decode(_:)` from literal `Data`, which is why both
+   state-file path constants are in the forbidden list.
+3. **No suite instantiates a window or calls `NSApp`.** Every suite is a
+   pure-function test, so the rule is vacuous today. If one ever needs a window
    it uses `orderFrontRegardless()` and never the activation call, which steals
    focus from the developer's session and has previously corrupted the config.
 4. **The forbidden-reference grep is scoped to `test/harness/*.swift`**, never to
@@ -133,6 +134,8 @@ impure collectors are off limits by name.
 | 7 | `commands(for:)`: the scoped/unscoped split, the single batched `scutil`, explicit netmasks, the `-ifscope` suffix and the prologue → install → sweep partition |
 | 8 | `gate` |
 | 9 | `NetState.decode`'s rejection list, from literal `Data` |
+| 11 | `tunnelScope`, `TunnelAttribution.decode` and `attributionOutcome`, all from literals: the address witness in all three directions, `.none` for an unusable snapshot, the decoder's rejections and its field drops, the **round trip** through the pinned encoder, and the tick table including the two-tick address rule |
+| 12 | the planner under each tunnel scope, against fixtures: the `late-tunnel` discrimination case and its fail-closed twin, clause (f)'s withholding on `live-shape` and its composition with clause (g) on `live-shape.stale-en8`, `lingering-utun` under both witness outcomes, `carried-home`'s unchanged 118/236, `.none` via `interfaces.lo0-only.json`, `vpn-up` under both answers, and `dropRevivedTunnelActions` |
 | 13 | clause (f)'s install-target ladder and `preferredInstallTarget`: the four `dual-default` snapshots against one byte-identical route table, the two pre-lookup rejection reasons of `unspecified-default`, the unchanged rungs 4-5 on `two-physical`, the unchanged `carried-home`/`vpn-up` answers, and the preference function in isolation from literals |
 
 Suites 1-9 are a **reconstruction** and cannot be faithful to the lost original.

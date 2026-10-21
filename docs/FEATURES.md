@@ -301,6 +301,53 @@ from both the pid file and a process scan, not from the pid file alone — so a
 healthy session is never disturbed. It runs at app launch, on wake, and on a
 network change, and every plan entry and its outcome goes to the daemon log.
 
+#### Which tunnels it will touch
+
+The reconcile acts on a tunnel in exactly two cases: when its interface **no
+longer exists**, so nothing running can own it; or when it can positively
+identify the tunnel as its own **by name and by the address that tunnel was
+carrying** while the app held it. It never touches a live tunnel it cannot
+identify that way, whoever it belongs to.
+
+That means a third-party VPN — Tailscale, Zscaler, a profile-installed IKEv2
+tunnel — is protected by **being up**, not by appearing on any list. One brought
+up before a connect, during a session, or next week is treated identically,
+because the question asked is "is this interface alive, and is it the one we
+recorded?" rather than "was it on the list we wrote when we connected?".
+
+#### What it stopped doing, and what that leaves behind
+
+This is a simpler rule than the one before it, and it repairs strictly less. The
+cases where it now leaves state behind, named rather than discovered:
+
+- **With an unusable interface snapshot it emits nothing at all** — no route
+  deletion and, unlike before, no configd removal either. If the interface list
+  cannot be read, there is no way to tell whether a `utun`'s resolver override
+  belongs to something that is still running, and clearing somebody else's DNS
+  because we are blind is the wrong way to be wrong. The reconcile records the
+  unusable snapshot and the next run — at launch, on wake, on a network change —
+  does the repair.
+- A lingering `utun` **of ours with no witnessed address** is left alone until
+  its interface goes. So is one whose session never resolved an identity: the
+  observation was ambiguous, it timed out, openconnect exited before its
+  interface appeared, or the interface appeared and never took an address.
+- A tunnel started by a **daemon from before this change**, or one whose
+  identity record could not be written, is in the same position.
+- Every connect over the **sudoers-helper** backend is too (see below).
+
+In all of those the residue — the tunnel's default route and its resolver
+override — survives until the interface itself goes, which a disconnect that
+runs the route script to completion, or a reboot, both achieve. The reported
+carried-home failure is **not** in that set: there the `utun` was already gone,
+which is the case the first rule covers with no record of any kind.
+
+One more thing it now refuses to do: when an **unscoped default route that the
+plan is not deleting survives** — a protected tunnel's, or a kept physical one —
+the install is **withheld and reported as withheld** rather than attempted. The
+kernel already has a default in that slot, so `route add default` could only
+fail, and the old behaviour was to issue it anyway and write "install default …"
+into the transcript regardless of the answer.
+
 A stale physical default — the carried-home `default 10.0.1.1` on a `192.168.1.0/24`
 link — is removed on **both** backends, and only ever as the first half of
 "remove the dead one, install a guarded replacement": the removal and the install
@@ -313,6 +360,16 @@ physical default and the guarded replacement) but **does not sweep** dead-gatewa
 routes. Porting a route-table parser and a mass deletion into POSIX shell would
 duplicate the riskiest code in the place it can be tested least. The daemon
 backend sweeps.
+
+That backend has a second, narrower asymmetry, from the identity rule above. It
+can **read** the identity record but can never write one: it hands the process
+over to `openconnect` with nothing of itself left running, so there is nobody to
+watch for the interface to appear. On that backend the reconcile therefore
+repairs one of our own tunnels only **after its interface has gone** — a
+lingering `utun` keeps its default route and its resolver keys until then. It is
+strictly safer and strictly less repairing than the daemon backend, and the
+trade is deliberate: the fallback transport is the one with the least evidence,
+so it is the one that should act least.
 
 ## LAN bypass
 

@@ -1,0 +1,12 @@
+[
+  { "name": "lo0", "ipv4s": [{ "ipv4": "127.0.0.1", "prefixLength": 8 }],
+    "isUp": true, "isLoopback": true, "isPointToPoint": false },
+  { "name": "en0", "ipv4s": [{ "ipv4": "10.0.1.22", "prefixLength": 24 }],
+    "isUp": true, "isLoopback": false, "isPointToPoint": false },
+  { "name": "utun0", "ipv4s": [{ "ipv4": "100.90.0.2", "prefixLength": 32 }],
+    "isUp": true, "isLoopback": false, "isPointToPoint": true },
+  { "name": "utun7", "ipv4s": [{ "ipv4": "192.168.204.16", "prefixLength": 32 }],
+    "isUp": true, "isLoopback": false, "isPointToPoint": true },
+  { "name": "utun9", "ipv4s": [{ "ipv4": "100.91.0.2", "prefixLength": 32 }],
+    "isUp": true, "isLoopback": false, "isPointToPoint": true }
+]

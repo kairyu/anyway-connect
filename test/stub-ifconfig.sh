@@ -20,6 +20,9 @@
 #   dual-default-en0-absent  — en8 only
 #   dual-default-en0-down    — both addressed, en0 printing NO `UP` token
 #
+# …plus the unusable snapshot the tunnel scope answers `none` for:
+#   lo0-only — lo0 and nothing else, mirroring interfaces.lo0-only.json
+#
 # Indentation matters: real ifconfig indents an interface's detail lines with a
 # TAB, so the tabs here are produced with printf rather than typed, and the inet
 # lines carry the netmask as the hex literal ifconfig actually prints.
@@ -100,6 +103,15 @@ case "${STUB_SNAPSHOT:-guard}" in
             'en8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500' \
             "${T}inet 192.168.1.42 netmask 0xffffff00 broadcast 192.168.1.255" \
             "${T}status: active"
+        ;;
+    lo0-only)
+        # The UNUSABLE snapshot: lo0 and nothing else, mirroring
+        # test/fixtures/interfaces.lo0-only.json. Neither "live" nor "dead" can
+        # be established from it, so the tunnel scope is `none` and reconcile
+        # acts on nothing at all.
+        printf '%s\n' \
+            'lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384' \
+            "${T}inet 127.0.0.1 netmask 0xff000000"
         ;;
     dual-default-en0-down)
         # en0 prints WITHOUT the `UP` token — the DOWN variant, which is

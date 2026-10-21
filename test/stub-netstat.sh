@@ -16,6 +16,14 @@
 #   tunnel-gw       — a default via a live utun's address, on a physical link
 #   down-link       — a default on a link that is addressed but DOWN
 #   interface-only  — an `-interface` default, gateway `link#15`, no IPv4 next hop
+# …and the two tables pick_install_target is asserted against (Test 7):
+#   dual-default        — en0 AND en8 each with an `-ifscope`-only default via its
+#                         own on-link router, EN0'S ROW PRINTED FIRST. The same
+#                         shape as test/fixtures/netstat-rn-inet.dual-default.txt,
+#                         so both arms answer the same question on one input.
+#   unspecified-default — three default rows: `0.0.0.0` on en9 and `link#7` on
+#                         en7, neither of them a link in any snapshot, beside
+#                         en8's healthy `-ifscope` default
 #
 # The column widths are the real ones, because the helper derives its column
 # indices from the header rather than counting fields.
@@ -100,6 +108,36 @@ case "${STUB_ROUTE_TABLE:-empty}" in
             'Internet:' \
             'Destination        Gateway            Flags               Netif Expire' \
             'default            link#15            UCSg                  en0       '
+        ;;
+    dual-default)
+        # Two usable links, each with a default that ordinary traffic does not
+        # use. en0's row is printed FIRST, so a tie resolved by print order
+        # cannot be told apart from one resolved by snapshot order — which is
+        # exactly why the snapshot is what decides.
+        printf '%s\n' \
+            'Routing tables' \
+            '' \
+            'Internet:' \
+            'Destination        Gateway            Flags               Netif Expire' \
+            'default            10.0.1.1           UGScIg                en0       ' \
+            'default            192.168.1.1        UGScIg                en8       ' \
+            '10.0.1/24          link#15            UCSc                  en0      !' \
+            '192.168.1/24       link#16            UCSc                  en8      !'
+        ;;
+    unspecified-default)
+        # The two pre-lookup rejection reasons in the default slot: `0.0.0.0`
+        # (unspecifiedGateway, step 3) and `link#7` (malformedGateway, step 2).
+        # Both are returned BEFORE the interface lookup, so neither row's link
+        # has to exist — and neither does, in any snapshot.
+        printf '%s\n' \
+            'Routing tables' \
+            '' \
+            'Internet:' \
+            'Destination        Gateway            Flags               Netif Expire' \
+            'default            0.0.0.0            UGSc                  en9       ' \
+            'default            link#7             UGSc                  en7       ' \
+            'default            192.168.1.1        UGScIg                en8       ' \
+            '192.168.1/24       link#16            UCSc                  en8      !'
         ;;
     empty)
         ;;

@@ -604,9 +604,50 @@ configd_tunnel_keys() {
     '
 }
 
+# Among the netifs in $2 (space-separated, in route-row order), the first that is
+# also a usable physical link in the snapshot $1 — walked in SNAPSHOT order.
+#
+# The port of NetReconcile.preferredInstallTarget. Two details are load-bearing:
+#
+#   * `physical_links` output is SORTED, so it must not be the walk order — it
+#     would answer `en10` on a machine with `en8` and `en10`, because `en10` sorts
+#     first as text. It is used here only as a membership test; the order comes
+#     from iface_snapshot, which emits links in ifconfig order.
+#   * `physical_links` is NOT isUsablePhysical: iface_snapshot reads `up` from the
+#     presence of the single ifconfig token `UP`, while the Swift snapshot requires
+#     IFF_UP && IFF_RUNNING. A link that is DOWN in the ordinary sense prints
+#     without the token, so that case IS caught on both arms; the one state this
+#     arm cannot see is "UP without RUNNING", i.e. a configured link with no
+#     carrier. The asymmetry is pre-existing (the guard itself reads the same
+#     single token at the `_g_up` assignment below) and is documented in
+#     docs/FEATURES.md rather than fixed, because adding a RUNNING column would
+#     shift every consumer that indexes $5… and the guard's `shift 4`.
+# $2 is SPACE-separated, not newline-separated: BWK awk — /usr/bin/awk on macOS
+# — rejects a literal newline inside a `-v` assignment ("awk: newline in string"),
+# and interface names never contain a space.
+preferred_install_target() {
+    [ -n "${2:-}" ] || return 1
+    _pi_links="$(physical_links "$1" | tr '\n' ' ')"
+    printf '%s\n' "$1" | awk -v offered="$2" -v links="$_pi_links" '
+        BEGIN {
+            n = split(offered, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") off[a[i]] = 1
+            n = split(links, b, " ");   for (i = 1; i <= n; i++) if (b[i] != "") ok[b[i]] = 1
+        }
+        $1 != "" && ($1 in off) && ($1 in ok) { print $1; found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
 # Install target selection, in the order this transport can honour: the netif of
 # a non-tunnel default row (unscoped preferred — the link whose default is
 # already there is the obvious target), else the single usable physical link.
+#
+# EVERY row-derived candidate is filtered through preferred_install_target, i.e.
+# through membership in `physical_links`, before it is accepted. Without that
+# filter this function picks the netif of a default row whose link is absent,
+# down or unaddressed — on the dual-homed transcript it chose `en0`, which the
+# reconcile had already judged unusable, and the install was then refused at
+# apply time while a healthy `en8` was never considered.
 #
 # Swift's step (1), netstate.physicalInterface, is not available here: this arm
 # reads only preexistingTunnels from the netstate (O-6). With two or more live
@@ -615,16 +656,23 @@ configd_tunnel_keys() {
 # onto the wrong network.
 pick_install_target() {
     _pt_snap="$1"
-    _pt_cand=""; _pt_scoped=""
+    _pt_unscoped=""; _pt_scoped=""
     while read -r _pt_n _pt_s _pt_gw; do
         [ -n "${_pt_n:-}" ] || continue
         snapshot_is_tunnel "$_pt_snap" "$_pt_n" && continue
-        if [ "$_pt_s" = "0" ]; then _pt_cand="$_pt_n"; break; fi
-        [ -n "$_pt_scoped" ] || _pt_scoped="$_pt_n"
+        # Every candidate is collected, not just the first of each kind: the
+        # first row's netif may well be the unusable one.
+        if [ "$_pt_s" = "0" ]; then
+            _pt_unscoped="$_pt_unscoped $_pt_n"
+        else
+            _pt_scoped="$_pt_scoped $_pt_n"
+        fi
     done <<EOF
 $(default_rows "$2")
 EOF
-    [ -n "$_pt_cand" ] || _pt_cand="$_pt_scoped"
+    _pt_cand="$(preferred_install_target "$_pt_snap" "$_pt_unscoped")" ||
+        _pt_cand="$(preferred_install_target "$_pt_snap" "$_pt_scoped")" ||
+        _pt_cand=""
     if [ -n "$_pt_cand" ]; then printf '%s\n' "$_pt_cand"; return 0; fi
 
     _pt_links="$(physical_links "$_pt_snap")"

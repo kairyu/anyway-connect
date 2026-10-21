@@ -122,18 +122,19 @@ enum Suite05Plan {
         // ("the link may come back with the same subnet"), and en1 is the only
         // usable link.
         //
-        // NOTE FOR THE NEXT CHANGE: the install target below is `en0` — the very
-        // link clause (b) has just classified unusable. That IS defect 3
-        // (design.md §4.1): rung 3 of the ladder reads `keptPhysicalDefaultNetifs`
-        // without filtering it through `isUsablePhysical`. This suite asserts the
-        // UNMODIFIED behaviour on purpose, because the harness has to be proved
-        // against the unmodified planner first. The defect-3 fix changes this
-        // one expectation to `en1`.
+        // The install target is `en1`, NOT the `en0` whose default row clause
+        // (b) just classified unusable: rung 3 offers `en0` and the ladder
+        // filters that offer through `isUsablePhysical` at the point of use, so
+        // rung 4 is reached and the one usable link is chosen. Until the defect-3
+        // fix this expectation was `en0` with the note `routeTable 10.0.1.1`, and
+        // the install was then refused at apply time — safe, and no repair. The
+        // note is `routeTable none` because en1 has no default row to inherit a
+        // gateway from; apply time derives one from the live DHCP lease.
         check("link-down", label: "link-down",
-              actions: [.installDefaultRoute(interface: "en0")],
+              actions: [.installDefaultRoute(interface: "en1")],
               kept: [.physicalDefaultUnusable(netif: "en0", why: "link down")]
                   + keptFromFixture("link-down"),
-              note: "routeTable 10.0.1.1; netstateAdvisory none")
+              note: "routeTable none; netstateAdvisory none")
 
         // ── lingering-utun: utun7 is still addressed with no tunnel process.
         // The two routes via its LIVE address are kept (FR-2.6c: the gateway is
@@ -250,31 +251,30 @@ enum Suite05Plan {
         H.eq(p.abort, .interfaceSnapshotUnusable,
              "(d″) an empty snapshot: a failed getifaddrs is not evidence of dead routes")
 
-        // ── Clause (f) rung 2 reads `staleDefaultNetifs.first` with NO
-        // usability filter, and clause (g) is therefore UNREACHABLE on this
-        // planner: a stale deletion can only exist when `staleDefaultNetifs` is
-        // non-empty, and a non-empty `staleDefaultNetifs` always yields rung 2 a
-        // target, so the "deleted without installing" condition cannot arise.
+        // ── Clause (g) is REACHABLE, and this is the case that reaches it.
         //
-        // The case below makes both facts visible at once. `unspecifiedGateway`
-        // is returned at step 3, BEFORE the interface lookup, so the row's link
-        // need not exist — and `en9` is absent from the snapshot, yet it is
-        // chosen as the install target over the two links that are present and
-        // addressed. That is defect 3 (design.md §4.2) at rung 2, and filtering
-        // rung 2 through `isUsablePhysical` is what will make clause (g)
-        // reachable.
+        // `unspecifiedGateway` is returned at step 3, BEFORE the interface
+        // lookup, so the row's link need not exist — and `en9` is absent from
+        // the snapshot. While rung 2 read `staleDefaultNetifs.first` unfiltered
+        // it answered `en9`, which meant (i) the install could never land, and
+        // (ii) clause (g) saw an `installDefaultRoute` and therefore did NOT
+        // withhold the `en9` deletion: a privileged delete with a provably
+        // unsatisfiable replacement. Rung 2 now filters its offer, so this plan
+        // reaches rung 5, records the genuine ambiguity between the two live
+        // links, and (g) withholds the deletion — nothing is deleted and nothing
+        // is installed, which is the correct answer to "which of these two
+        // networks should carry your traffic?".
         let header = "Destination        Gateway            Flags               Netif Expire"
         let twoLinks = [oneAddress("lo0", "127.0.0.1", 8, loopback: true),
                         oneAddress("en0", "192.168.1.42", 24),
                         oneAddress("en1", "192.168.2.42", 24)]
         p = NetReconcile.plan(routeTable: header + "\ndefault 0.0.0.0 UGScg en9",
                               interfaces: twoLinks, configdKeys: [], netstate: nil)
-        H.eqList(p.actions,
-                 [.deleteStalePhysicalDefaultRoute(netif: "en9", ifscoped: false,
-                                                   reason: .unspecifiedGateway),
-                  .installDefaultRoute(interface: "en9")],
-                 "rung 2 picks the ABSENT en9 over two live links (defect 3's hazard)")
-        H.eqList(p.kept, [], "and records no ambiguity, because rung 2 answered first")
+        H.eqList(p.actions, [],
+                 "rung 2 no longer offers the ABSENT en9, so nothing is deleted either")
+        H.eqList(p.kept, [.ambiguousInstallTarget(["en0", "en1"]),
+                          .defaultDeletionsWithheld(netifs: ["en9"])],
+                 "rung 5 records the ambiguity and clause (g) withholds the en9 deletion")
         H.eq(p.abort, nil, "the snapshot is usable, so nothing aborts")
 
         // The netstate hint outranks rung 2 — but only when it names a link the

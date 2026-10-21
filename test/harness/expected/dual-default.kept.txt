@@ -1,0 +1,13 @@
+onLinkRoute 10.0.1.0/24
+onLinkRoute 10.0.1.1/32
+onLinkRoute 10.0.1.42/32
+onLinkRoute 10.0.1.255/32
+loopback 127.0.0.0/8
+loopback 127.0.0.1
+onLinkRoute 169.254.0.0/16
+onLinkRoute 192.168.1.0/24
+onLinkRoute 192.168.1.1/32
+onLinkRoute 192.168.1.42/32
+onLinkRoute 192.168.1.255/32
+onLinkRoute 224.0.0.0/4
+onLinkRoute 255.255.255.255/32

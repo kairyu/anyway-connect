@@ -288,7 +288,13 @@ address from the live system rather than being told one. It:
   network or broadcast address — because the link that would carry it is present
   and working;
 - installs a physical default route only when it can justify the next hop, and
-  leaves routing untouched when it cannot.
+  leaves routing untouched when it cannot. A link the reconcile has already
+  judged unusable — absent from the interface snapshot, down, or carrying no
+  IPv4 — is never chosen as the install target, even when the route table still
+  holds a default row naming it. When two links both carry a usable default, the
+  one the kernel lists first is preferred, and when neither can be told apart the
+  reconcile records the ambiguity and installs nothing rather than guessing a
+  network.
 
 It **refuses to do anything at all while a tunnel process is alive** — judged
 from both the pid file and a process scan, not from the pid file alone — so a
@@ -320,6 +326,24 @@ One caveat found the hard way: the bundled `vpnc-script` sets `OverridePrimary`
 unconditionally — its own `#if`/`#fi` guard is commented out — and removing that
 silently converts a full tunnel into a split tunnel. Worth knowing before
 treating it as a knob.
+
+The same override has a second consequence, and it explains a decision in the
+reconcile: while the tunnel is up, `State:/Network/Global/IPv4`'s
+`PrimaryInterface` and `PrimaryService` both name the **tunnel**. configd's
+primary-service answer would otherwise be the obvious way to pick an install
+target, so it is deliberately not used — it names the `utun` exactly when the
+reconcile is trying to find a *physical* link, and on a post-crash table it is
+either the dead tunnel or whatever configd has recomputed. The interface snapshot
+is used instead.
+
+One asymmetry between the two privileged backends, recorded rather than fixed:
+the sudoers helper reads a link as "up" from the single `ifconfig` token `UP`,
+while the daemon requires `IFF_UP && IFF_RUNNING`. An ordinarily down link prints
+without the token and is rejected on both, so the only state the helper cannot
+see is "configured but no carrier". Teaching it to would mean adding a column to
+its interface snapshot and shifting every consumer that reads past it, including
+the on-link guard's own argument handling, to reject a state the preferred
+backend already rejects.
 
 A second delta in the same copied script: its `get_default_gw()` can answer with
 a `utun`'s *own* address — exactly the value that blackholed the carried-home

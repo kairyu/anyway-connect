@@ -128,11 +128,12 @@ impure collectors are off limits by name.
 | 2 | `parseRouteTable`: row counts, `isIfScoped` from the `I` flag, `gatewayText` verbatim, every destination kind, both netstat abbreviation rules, and the fail-closed `[]` |
 | 3 | `configdKeys(fromScutilOutput:)` and `matchConfigdKey`. The latter is `private`, so it is driven through clause (a) of `plan`, the one observable it feeds |
 | 4 | `physicalDefault` and `deriveDefaultGateway`, including the exact transcript |
-| 5 | `plan` on all nine committed fixtures: the ordered action list, the abort, the exact ordered `kept` multiset and the install-candidate note |
+| 5 | `plan` on every committed fixture: the ordered action list, the abort, the exact ordered `kept` multiset and the install-candidate note |
 | 6 | the full ordered sweep list, against the independently derived literal |
 | 7 | `commands(for:)`: the scoped/unscoped split, the single batched `scutil`, explicit netmasks, the `-ifscope` suffix and the prologue → install → sweep partition |
 | 8 | `gate` |
 | 9 | `NetState.decode`'s rejection list, from literal `Data` |
+| 13 | clause (f)'s install-target ladder and `preferredInstallTarget`: the four `dual-default` snapshots against one byte-identical route table, the two pre-lookup rejection reasons of `unspecified-default`, the unchanged rungs 4-5 on `two-physical`, the unchanged `carried-home`/`vpn-up` answers, and the preference function in isolation from literals |
 
 Suites 1-9 are a **reconstruction** and cannot be faithful to the lost original.
 What they can be is derived from the code they test, which is what the table

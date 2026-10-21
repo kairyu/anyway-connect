@@ -187,6 +187,41 @@ STUB_ROUTE_TABLE=interface-only
 check "$(stale)" "-" \
       "case 8  an -interface default has no IPv4 next hop to judge: kept"
 
+echo "== Test 7: pick_install_target — §4.3's filter and preference rule on this arm =="
+# The DECISION only. Nothing here runs `route`: the function reads a snapshot and
+# a table and prints the netif it would install an unscoped default onto.
+#
+# The shell twins of the Swift harness's Suite 13 cases 1, 3, 4 and 5, against
+# the same two route tables. Before the filter, every one of the last three
+# answered with a netif the snapshot cannot use.
+target() {
+    if _t_pick="$(pick_install_target "$(iface_snapshot)" \
+                      "$("$NETSTAT" -rn -f inet)" 2>/dev/null)"; then
+        printf '%s\n' "$_t_pick"
+    else
+        echo "-"
+    fi
+}
+
+STUB_ROUTE_TABLE=dual-default
+STUB_SNAPSHOT=dual-default
+check "$(target)" "en0" \
+      "case 1  two -ifscope-only defaults, both links usable: the one the snapshot lists first"
+STUB_SNAPSHOT=dual-default-reversed
+check "$(target)" "en8" \
+      "case 2  the SAME table against the SAME links in the other order: en8 — so it is a rule"
+STUB_SNAPSHOT=dual-default-en0-absent
+check "$(target)" "en8" \
+      "case 3  en0 absent from the snapshot: en8, not the netif the route rows still name"
+STUB_SNAPSHOT=dual-default-en0-down
+check "$(target)" "en8" \
+      "case 4  en0 printing no UP token: en8 — the DOWN variant, expressible on this arm"
+
+STUB_ROUTE_TABLE=unspecified-default
+STUB_SNAPSHOT=dual-default-en0-absent      # en8 only; en9 and en7 are absent
+check "$(target)" "en8" \
+      "case 5  a 0.0.0.0 default on en9 and an -interface default on en7, neither link present: en8"
+
 echo ""
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

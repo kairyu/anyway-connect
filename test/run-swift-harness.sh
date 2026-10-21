@@ -51,7 +51,7 @@ D=/tmp/anyway-scratch                      # the FIXED path; the binary is alway
 # file fails here.
 mkdir -p "$D" || exit 1
 fixtures="clean vpn-up carried-home lingering-utun link-down no-default
-          two-physical two-tunnels cap-exceeded"
+          two-physical two-tunnels cap-exceeded dual-default unspecified-default"
 for f in $fixtures; do
     for kind in sweep kept; do
         want="test/harness/expected/$f.$kind.txt"
@@ -70,6 +70,28 @@ for f in $fixtures; do
 done
 rm -f "$D/derived.txt"
 echo "derivation: every expected list re-derived from the fixtures and identical"
+# `dual-default` is the one route table shared by FOUR snapshots, which is the
+# whole point of it: the install target must come from the snapshot and not from
+# netstat print order. Suite 13 asserts all four against ONE pair of expected
+# files, so the claim that its sweep and its clause-(c) kept records are
+# IDENTICAL under every snapshot is derived here rather than assumed. The two
+# stale host routes are off-link for every link in every one of them.
+for snap in dual-default.reversed dual-default.en0-absent dual-default.en0-down; do
+    for kind in sweep kept; do
+        if [ "$kind" = kept ]; then
+            sh test/harness/derive-expected.sh --kept dual-default "$snap" > "$D/derived.txt" 2>/dev/null
+        else
+            sh test/harness/derive-expected.sh dual-default "$snap" > "$D/derived.txt" 2>/dev/null
+        fi
+        if ! diff -u "test/harness/expected/dual-default.$kind.txt" "$D/derived.txt"; then
+            echo "dual-default's $kind list is not snapshot-independent ($snap)" >&2
+            rm -f "$D/derived.txt"
+            exit 1
+        fi
+    done
+done
+rm -f "$D/derived.txt"
+echo "derivation: dual-default's sweep is identical under all four of its snapshots"
 
 # The README's multi-netif check, with the sweep's own destination filters
 # applied, so "every swept destination appears on exactly one netif" is CHECKED

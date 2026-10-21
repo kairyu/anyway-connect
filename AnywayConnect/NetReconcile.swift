@@ -611,11 +611,23 @@ extension NetReconcile {
                 case .gatewayOffLink, .gatewayIsTunnelAddress, .gatewayIsOwnAddress,
                      .unspecifiedGateway, .gatewayIsNetworkAddress,
                      .gatewayIsBroadcastAddress:
-                    // THE CARRIED-HOME BLACKHOLE. Every reason here is derived from a
-                    // link that IS present, up and addressed, so the next hop
-                    // provably cannot carry traffic on that link: deleting it costs
-                    // nothing that works, and is a precondition for installing one
-                    // that does.
+                    // THE CARRIED-HOME BLACKHOLE. Every reason here describes a next
+                    // hop that cannot carry traffic ON THAT LINK, so deleting the row
+                    // costs nothing that works and is a precondition for installing
+                    // one that does.
+                    //
+                    // It does NOT follow that the link is present, up and addressed —
+                    // an earlier version of this comment claimed exactly that and was
+                    // wrong. `unspecifiedGateway` is returned at step 3 of
+                    // `evaluateDefaultGateway` and `malformedGateway` at step 2, both
+                    // BEFORE the interface lookup at NetGuard.swift:276, so a
+                    // `default 0.0.0.0 … en9` row still lands here with `en9` absent
+                    // or down. That is why the install-target ladder below filters
+                    // `staleDefaultNetifs` through `isUsablePhysical` at the point of
+                    // use rather than trusting this list to name a usable link.
+                    // `evaluateDefaultGateway` also never tests `isLoopback` while
+                    // `isUsablePhysical` does, so the same membership filter catches a
+                    // `default … lo0` row with no separate rule.
                     actions.append(.deleteStalePhysicalDefaultRoute(
                         netif: row.netif, ifscoped: row.isIfScoped, reason: reason))
                     staleDefaultNetifs.append(row.netif)
@@ -781,10 +793,18 @@ extension NetReconcile {
             var target: String?
             if let ns = netstate, candidates.contains(ns.physicalInterface) {
                 target = ns.physicalInterface
-            } else if let netif = staleDefaultNetifs.first {
-                // The link whose default we just removed is the obvious replacement.
+            } else if let netif = preferredInstallTarget(offered: staleDefaultNetifs,
+                                                         interfaces: interfaces) {
+                // The link whose default we just removed is the obvious replacement —
+                // but only if it is a link at all. Both this rung and the next are fed
+                // by lists clause (b) built, and clause (b) records links it has itself
+                // judged unusable, so each offer is filtered at the point of USE. Not
+                // at the point of record: clause (g) below needs `staleDefaultNetifs`
+                // unfiltered, because a stale default on an absent link is still a
+                // deletion whose withholding has to be recorded.
                 target = netif
-            } else if let netif = keptPhysicalDefaultNetifs.first {
+            } else if let netif = preferredInstallTarget(offered: keptPhysicalDefaultNetifs,
+                                                         interfaces: interfaces) {
                 target = netif
             } else if candidates.count == 1 {
                 target = candidates[0]
@@ -834,6 +854,30 @@ extension NetReconcile {
     /// `ambiguousInstallTarget` list.
     private static func isUsablePhysical(_ iface: NetInterface) -> Bool {
         iface.isUp && !iface.isTunnelLike && !iface.isLoopback && iface.ipv4 != nil
+    }
+
+    /// Among `offered`, the first entry that is also a usable physical link — in
+    /// INTERFACE SNAPSHOT order, never route-table order.
+    ///
+    /// The snapshot's order is part of its contract: `NetProbe.interfaces()` builds
+    /// an explicit `order` array (NetGuard.swift:568) and returns `order.map { … }`
+    /// (:600-608) precisely so `getifaddrs(3)` order survives. Route-table order, by
+    /// contrast, is a statement about a text format rather than about the links: the
+    /// old `.first` on clause (b)'s lists resolved a dual-homed tie by whichever
+    /// physical default configd happened to print first, which nothing could assert.
+    /// Being wrong here is bounded — the gateway is re-derived and re-guarded at
+    /// apply time, no physical default is deleted on this path, and both links keep
+    /// their `-ifscope` rows.
+    ///
+    /// Internal rather than private so the harness can drive it from literals;
+    /// `plan`'s clause (f) is the only production caller.
+    static func preferredInstallTarget(offered: [String],
+                                       interfaces: [NetInterface]) -> String? {
+        let offeredSet = Set(offered)
+        return interfaces.lazy
+            .filter(isUsablePhysical)
+            .map(\.name)
+            .first { offeredSet.contains($0) }
     }
 
     private static func matchConfigdKey(_ key: String) -> (tunnel: String, kind: String)? {

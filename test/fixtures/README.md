@@ -233,6 +233,36 @@ different network" the whole point of the pair.
 | `netstat-rn-inet.two-tunnels.txt`, `interfaces.two-tunnels.json`, `scutil-keys.two-tunnels.txt` | synthetic: `utun0` and `utun7` each with a default route and a pair of configd keys — the third-party-VPN case. `utun0` carries **no IPv4**, which is the live shape of this machine's system tunnels, so it also pins that an IPv4-less link is present in the snapshot rather than omitted |
 | `netstat-rn-inet.link-down.txt`, `interfaces.link-down.json` | synthetic: `en0` addressed but **not up** with its default via an off-link gateway, beside a second live link so the snapshot stays usable |
 | `netstat-rn-inet.no-default.txt`, `interfaces.no-default.json` | synthetic: `en0` up with its on-link row and **no default row at all** — the state the vendored script's own teardown leaves behind |
+| `netstat-rn-inet.dual-default.txt` | synthetic: `en0` and `en8` each with an **`-ifscope`-only** default (`UGScIg`) via its own on-link router — `en0 = 10.0.1.42/24` via `10.0.1.1`, `en8 = 192.168.1.42/24` via `192.168.1.1`, **`en0`'s row printed first** — plus each link's `link#N` on-link row, its `/32` self and router rows and its broadcast row, and two stale `/32` host routes via the dead gateway `100.64.9.9` so the sweep is non-empty and countable. Neither default serves unbound traffic, so clause (f) must install one, which is what makes the fixture a question about *which link* |
+| `interfaces.dual-default.json`, `.reversed.json`, `.en0-absent.json`, `.en0-down.json` | **four snapshots against that one route table.** `dual-default` lists `en0` then `en8`, both up and addressed; `reversed` lists the *same two links* with `en8` first; `en0-absent` has `en8` only (the measured dual-homed transcript, where `en0`'s route rows persist after the link has left the snapshot); `en0-down` has both present and addressed with `en0` `"isUp": false` |
+| `netstat-rn-inet.unspecified-default.txt`, `interfaces.unspecified-default.json` | synthetic: three default rows — `default 0.0.0.0 … UGSc en9`, `default link#7 … UGSc en7`, and `en8`'s healthy `-ifscope` default — against a snapshot holding `en8` **only**. `en9` and `en7` are absent on purpose: `unspecifiedGateway` (step 3) and `malformedGateway` (step 2) are both returned *before* `evaluateDefaultGateway`'s interface lookup, so a default row can name a link that does not exist |
+
+#### Why four snapshots share one route table
+
+The install target has to come from the interface snapshot, not from `netstat`
+print order, and the only way to make that a falsifiable claim is to hold the
+route table fixed. `dual-default` and `dual-default.reversed` describe the
+**same two links** in the opposite order against a **byte-identical** table, and
+the harness expects `en0` for the first and `en8` for the second. A planner
+reading print order answers `en0` for both and fails the second — an assertion
+that cannot be written against print order at all, because print order is a
+statement about a text format rather than about the links.
+
+`en0-absent` and `en0-down` are the two shapes of the same trap: a default row
+whose netif the reconcile has itself just recorded as unusable
+(`why: "target not addressed"` and `why: "link down"` respectively).
+
+#### The `0.0.0.0` gateway row is synthetic
+
+Real `netstat -rn` prints `link#N` for a route with no next hop, never a literal
+`0.0.0.0`. The row is committed deliberately anyway, because the two readings
+reach `evaluateDefaultGateway` by different steps and both have to be exercised:
+`IPv4("0.0.0.0")` parses and is `isUnspecified`, so it is **step 3**
+(`unspecifiedGateway`), while `IPv4("link#7")` is `nil`, so that row is **step 2**
+(`malformedGateway`). Both readings were confirmed against `parseRouteTable`,
+which stores the gateway column verbatim as `gatewayText` beside
+`IPv4(gatewayText)`. The `link#7` row is the realistic form; the `0.0.0.0` row is
+the only way to drive step 3 from a fixture.
 
 ## The sweep count N, derived independently of the planner
 
@@ -318,6 +348,15 @@ Each is produced by `sh test/harness/derive-expected.sh <name>` and committed:
 | `two-physical` | `two-physical` | 0 | 0 | 9 |
 | `two-tunnels` | `two-tunnels` | 0 | 0 | 8 |
 | `cap-exceeded` | `clean` | 300 (over the 256 cap) | 0 | 1 |
+| `dual-default` | `dual-default` | 2 | 4 | 13 |
+| `unspecified-default` | `unspecified-default` | 0 | 0 | 8 |
+
+`dual-default`'s counts are **identical under all four of its snapshots** — both
+stale host routes go via `100.64.9.9`, which is off-link for every link in every
+one of them — so the four harness cases share one pair of expected files. That
+identity is derived rather than assumed: `test/run-swift-harness.sh` re-derives
+the list against `reversed`, `en0-absent` and `en0-down` as well and diffs all
+three against the committed `dual-default` files.
 
 `vpn-up` sweeping **nothing** is the discrimination test for the whole
 classifier, not a vacuous case: it is the same table as `carried-home` seen from

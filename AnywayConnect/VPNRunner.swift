@@ -118,6 +118,14 @@ final class VPNRunner {
 
     // MARK: - Status
 
+    /// `.connected(key: "?", host: "?")` is DELIBERATE and is not the defect.
+    ///
+    /// It is the honest answer for a tunnel that is running with no endpoint record
+    /// to name it — one launched from a shell, or one started by another session.
+    /// The reported "Connected: ?" was a SYMPTOM of `teardownNow()` clearing that
+    /// record while openconnect was still alive, and the fix belongs there, not
+    /// here: making this arm lie about the tunnel's absence would hide a live
+    /// privileged session from the only UI that reports one.
     func currentState() -> VPNState {
         if isRunning() {
             if let line = try? String(contentsOf: endpointFile, encoding: .utf8) {
@@ -127,6 +135,20 @@ final class VPNRunner {
             return .connected(key: "?", host: "?")
         }
         return .disconnected
+    }
+
+    /// What a daemon stop licenses the app to do next. Declared beside the
+    /// transport enum because it is the same kind of thing: a decision about which
+    /// transport speaks and what its answer is worth.
+    enum TeardownFollowUp: Equatable {
+        /// Nothing of ours is running. Clear the bookkeeping and stop here.
+        case clearAndReturn
+        /// Something may still be running. KEEP the bookkeeping and try the
+        /// fallback.
+        case keepAndFallThrough(invalidateTransport: Bool)
+        /// The daemon answered "no" about the request itself. Keep state, do not
+        /// retry on a weaker transport.
+        case keepAndReturn
     }
 
     // MARK: - Privileged transport
@@ -267,8 +289,15 @@ final class VPNRunner {
         stateLock.lock(); defer { stateLock.unlock() }; return busySnapshot
     }
 
+    /// ONE literal, used by `isRunning()` and by `teardownNow()`'s fallback
+    /// discovery. Hoisted because the second of those now FILTERS what it finds
+    /// through `TunnelStop.isOurOpenconnect` and must scan for the same thing it
+    /// filters; its twin is the daemon's `openconnectPattern`, and the harness
+    /// runner asserts there is exactly one occurrence of it in each file.
+    static let openconnectPattern = "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"
+
     func isRunning() -> Bool {
-        !shellCapture("/usr/bin/pgrep", ["-f", "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"])
+        !shellCapture("/usr/bin/pgrep", ["-f", Self.openconnectPattern])
             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -945,6 +974,13 @@ final class VPNRunner {
                 return nil
             case .refused(let message):
                 return message
+            case .failed(let message):
+                // Behaves as `.refused` does, and for the same reason: the daemon
+                // spawned nothing, so the ungated sudo `exec` must not run into
+                // whatever state it left. The daemon's startTunnel produces no
+                // `.failed` today — this arm exists so that adding one later is a
+                // one-line change here and not a silent fall-through to sudo.
+                return message
             case .unreachable:
                 appendLog("[anyway] daemon unreachable — falling back to sudo")
                 invalidateTransportCache()
@@ -1045,16 +1081,102 @@ final class VPNRunner {
     /// the work before the machine suspends, and `disconnect(completion:)`'s hop to main
     /// would never run. Same body as before, under a name that says what callers use it
     /// for — `disconnect(completion:)` still wraps it for the UI.
+    /// What the daemon's answer licenses. PURE, and factored out so the table that
+    /// encodes "do not clear on a stop that stopped nothing" is testable.
+    static func teardownFollowUp(_ outcome: PrivilegedOutcome) -> TeardownFollowUp {
+        switch outcome {
+        // `.ok` covers both "nothing of ours was running" and "stopped it", and
+        // clearing is correct for both: in each, no tunnel of ours is running, so
+        // the endpoint record names nothing. The fix is not "never clear" — it is
+        // "clear only when the absence of a tunnel of ours has been ESTABLISHED
+        // rather than assumed".
+        case .ok:          return .clearAndReturn
+        case .failed:      return .keepAndFallThrough(invalidateTransport: false)
+        case .unreachable: return .keepAndFallThrough(invalidateTransport: true)
+        case .refused:     return .keepAndReturn
+        }
+    }
+
+    /// Which of `candidates` is one of OUR openconnects, judged from a single
+    /// batched `ps -ww -o pid=,command=`. PURE, so the filter is assertable over
+    /// literal `ps` output instead of by signalling something.
+    ///
+    /// argv[0] is the strongest thing an UNPRIVILEGED caller can read —
+    /// `proc_pidpath` against a root-owned process returns EPERM, and every
+    /// openconnect this project starts runs as root — and the two argv markers
+    /// carry the weight either way.
+    ///
+    /// Fails CLOSED: a pid with no readable line is refused, not signalled.
+    static func ourOpenconnects(among candidates: [Int32], psOutput: String,
+                                scriptPath: String)
+        -> (verified: [Int32], refused: [Int32]) {
+        var verified: [Int32] = []
+        for line in psOutput.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ", maxSplits: 1,
+                                    omittingEmptySubsequences: true)
+            guard fields.count == 2,
+                  let pid = Int32(fields[0].trimmingCharacters(in: .whitespaces)),
+                  candidates.contains(pid) else { continue }
+            let command = fields[1].trimmingCharacters(in: .whitespaces)
+            guard TunnelStop.isOurOpenconnect(
+                      execPath: String(command.split(separator: " ").first ?? ""),
+                      command: command,
+                      scriptPath: scriptPath) else { continue }
+            if !verified.contains(pid) { verified.append(pid) }
+        }
+        return (verified.sorted(), candidates.filter { !verified.contains($0) }.sorted())
+    }
+
+    /// Is any of these pids still alive?
+    ///
+    /// On `/bin/ps`, NEVER on `kill(pid, 0)`. This app runs as the desktop user and
+    /// every openconnect it starts runs as root, so `kill(root_pid, 0)` returns
+    /// EPERM — "alive, but not yours" read as "dead" — and the caller would then
+    /// clear the endpoint record out from under a LIVE tunnel, which is the exact
+    /// defect this change exists to remove. `ps -p` lists a process whatever its
+    /// owner. If a `kill(0)` is ever reintroduced anywhere app-side,
+    /// `errno == EPERM` MUST be treated as ALIVE.
+    ///
+    /// Bounded at 3 s, and a TIMEOUT counts as alive: on no evidence the
+    /// bookkeeping is kept rather than discarded. A `ps` that cannot be launched at
+    /// all is indistinguishable from "none of them exist" through
+    /// `shellCaptureSplit`, which discards the exit status; that is the one gap,
+    /// and `/bin/ps` missing is not a state this app can do anything useful in.
+    private func anyStillAlive(_ pids: [Int32]) -> Bool {
+        guard !pids.isEmpty else { return false }
+        let csv = pids.map(String.init).joined(separator: ",")
+        let result = shellCaptureSplit("/bin/ps", ["-o", "pid=", "-p", csv], timeout: 3)
+        if result.timedOut {
+            appendLog("[anyway] ps timed out checking \(csv) — treating them as still alive")
+            return true
+        }
+        return result.out.split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+            .contains { pids.contains($0) }
+    }
+
     func teardownNow() {
+        // Set in the `.failed` arm ONLY. `.unreachable` means the daemon said
+        // nothing at all, which is no evidence that something is running, so an
+        // empty `verified` after it may still clear.
+        var daemonSaidSomethingMayRun = false
+
         if privilegedTransport() == .daemon {
-            let result = PrivilegedClient.shared.stopTunnel()
-            appendLog("[anyway] privileged daemon stop: \(result.message)")
-            if result.ok {
+            let outcome = PrivilegedClient.shared.stopTunnel()
+            appendLog("[anyway] privileged daemon stop: \(outcome.message)")
+            switch Self.teardownFollowUp(outcome) {
+            case .clearAndReturn:
                 try? FileManager.default.removeItem(at: endpointFile)
                 return
+            case .keepAndReturn:
+                appendLog("[anyway] daemon refused the stop — endpoint record kept")
+                return
+            case .keepAndFallThrough(let invalidate):
+                if case .failed = outcome { daemonSaidSomethingMayRun = true }
+                appendLog("[anyway] daemon stop did not stop the tunnel — "
+                        + "endpoint record kept, falling back to sudo")
+                if invalidate { invalidateTransportCache() }
             }
-            appendLog("[anyway] daemon stop failed — falling back to sudo")
-            invalidateTransportCache()
         }
         var pids: [String] = []
         // The helper writes a root-owned pid file; the no-helper fallback writes
@@ -1064,27 +1186,77 @@ final class VPNRunner {
                 pids += s.split(whereSeparator: { $0.isNewline || $0 == " " }).map(String.init)
             }
         }
-        pids += shellCapture("/usr/bin/pgrep", ["-f", "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"])
+        pids += shellCapture("/usr/bin/pgrep", ["-f", Self.openconnectPattern])
             .split(whereSeparator: { $0.isNewline }).map(String.init)
-        let unique = Array(Set(pids.filter { !$0.isEmpty && Int($0) != nil }))
+        // `> 1` for the same reason the daemon applies it: `sudo kill -INT 0` would
+        // signal this app's own process group.
+        let unique = Array(Set(pids.compactMap { Int32($0) }.filter { $0 > 1 })).sorted()
+
+        // No transport signals a pid it has not identified. The daemon refuses to
+        // signal one it cannot establish as ours, and this path must not undo that
+        // one layer up — it signals as root through sudo. ONE batched bounded call
+        // for every candidate: the unbounded `shellCapture` must not be used on a
+        // teardown path, and one `ps` per pid is unbudgeted too.
+        var verified: [Int32] = []
         if !unique.isEmpty {
+            let probe = shellCaptureSplit(
+                "/bin/ps",
+                ["-ww", "-o", "pid=,command=", "-p", unique.map(String.init).joined(separator: ",")],
+                timeout: 3)
+            let filtered = Self.ourOpenconnects(among: unique, psOutput: probe.out,
+                                                scriptPath: PrivilegedInstaller.routeWrapper)
+            verified = filtered.verified
+            // Named BY NUMBER, because that is the information the user needs to
+            // finish by hand. The cost of the rule, stated rather than buried: an
+            // unreadable `ps` refuses everything and the app's last resort is gone.
+            // That is the fail-closed direction, and it is the one to be wrong in.
+            for pid in filtered.refused {
+                appendLog("[anyway] refusing to signal pid \(pid): not our openconnect")
+            }
+        }
+
+        if !verified.isEmpty {
+            let argv = verified.map(String.init)
             if helperIsUsable() {
-                _ = shellCapture("/usr/bin/sudo", ["-n", rootHelper, "stop"] + unique)
+                _ = shellCapture("/usr/bin/sudo", ["-n", rootHelper, "stop"] + argv)
             } else {
                 // Same reasoning as the root helper's stop: give the graceful
                 // teardown time to run its disconnect script before escalating.
-                _ = shellCapture("/usr/bin/sudo", ["kill", "-INT"] + unique)
+                _ = shellCapture("/usr/bin/sudo", ["kill", "-INT"] + argv)
                 var waited = 0.0
-                while waited < 10.0, isRunning() {
+                while waited < 10.0, anyStillAlive(verified) {
                     Thread.sleep(forTimeInterval: 0.25); waited += 0.25
                 }
-                if isRunning() {
-                    _ = shellCapture("/usr/bin/sudo", ["kill", "-TERM"] + unique)
+                if anyStillAlive(verified) {
+                    _ = shellCapture("/usr/bin/sudo", ["kill", "-TERM"] + argv)
                 }
             }
         }
-        try? FileManager.default.removeItem(at: pidFile)
-        try? FileManager.default.removeItem(at: endpointFile)
+
+        // The SAME defect lived on this path: it cleared unconditionally after the
+        // kill sequence, whether or not anything died. Gated on the pids actually
+        // signalled, and NOT on isRunning() — that is the broad `pgrep`, so an
+        // unrelated openconnect carrying either marker would keep the endpoint
+        // record indefinitely and `currentState()` would return
+        // `.connected(key: "?", host: "?")` forever: the user's transient symptom
+        // made permanent.
+        //
+        // The second clause is the fail-closed decision holding at the LAST branch
+        // rather than only at the first: an empty `verified` after the daemon said
+        // "something may still be running" means nobody could identify it, which is
+        // not evidence of absence.
+        let stillAlive = anyStillAlive(verified)
+        if !stillAlive && !(daemonSaidSomethingMayRun && verified.isEmpty) {
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: endpointFile)
+        } else if stillAlive {
+            appendLog("[anyway] openconnect still running after the fallback stop — "
+                    + "endpoint record kept")
+        } else {
+            appendLog("[anyway] the daemon found something it could not stop and this "
+                    + "transport could not identify it either — absence was never "
+                    + "established, so the endpoint record is kept")
+        }
     }
 
     // MARK: - Helpers
@@ -1230,6 +1402,13 @@ final class VPNRunner {
                 // the message carries the derivation transcript.
                 appendLog("[anyway] privileged daemon refused the restore: \(message)")
                 return
+            case .failed(let message):
+                // The daemon ran it and the postcondition did not hold, which is
+                // not an answer about the request — so the helper may legitimately
+                // try, and the transport cache is NOT dropped because the daemon is
+                // healthy. Not produced by this call today.
+                appendLog("[anyway] privileged daemon restore did not take effect "
+                        + "(\(message)) — falling back to sudo")
             case .unreachable(let message):
                 appendLog("[anyway] privileged daemon unreachable (\(message)) — "
                         + "falling back to sudo")

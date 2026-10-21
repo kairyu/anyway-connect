@@ -147,6 +147,18 @@ public func daemonCodeRequirement() -> String? {
 
     /// Signal the tunnel down gracefully, waiting for openconnect to run its
     /// own disconnect teardown before escalating.
+    ///
+    /// The `Bool` is sufficient for THIS one operation and the signature is
+    /// deliberately unchanged. `stopTunnel` takes no arguments, performs no
+    /// validation and has no guard refusal, so `false` has exactly one meaning:
+    /// "the daemon found something and did not stop it" — a stuck process, or a
+    /// live one it could not establish as ours and therefore refused to signal.
+    /// The client maps it to `PrivilegedOutcome.failed`, on which the app keeps
+    /// its endpoint record and falls through to the sudo transport.
+    ///
+    /// `kPrivilegedProtocolVersion` therefore stays 2. A bump would make
+    /// `PrivilegedClient.isUsable()` reject the daemon currently installed and
+    /// running, silently dropping the app to the sudo transport until a reinstall.
     func stopTunnel(reply: @escaping (Bool, String) -> Void)
 
     /// Whether a tunnel process is alive, and its pid.

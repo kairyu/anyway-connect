@@ -93,6 +93,7 @@ IFCONFIG=/sbin/ifconfig
 IPCONFIG=/usr/sbin/ipconfig
 NETSTAT=/usr/sbin/netstat
 SCUTIL=/usr/sbin/scutil
+PS=/bin/ps
 
 # Set by gw_on_link_for for in-process callers (the parity test, which sources
 # this file). Declared here because the script runs under `set -u` — and because
@@ -853,6 +854,39 @@ EOF
     printf '%s\n' "$_sd_found"
 }
 
+# --- No transport signals a pid it has not identified -----------------------
+#
+# PURE: classifies a command line and runs NOTHING, so the parity suite can drive
+# it from literals while the `stop` subcommand itself is never executed by a test.
+#
+# The same three conjuncts as TunnelStop.isOurOpenconnect, in the same order of
+# cheapness: both of the app's argv markers, then argv[0]'s last path component
+# being exactly `openconnect`. The marker pair is the load-bearing part and is
+# STRICTER than the pgrep pattern the app scans with, which accepts either one;
+# $ROUTE_WRAPPER is a root-owned file in a root-owned directory that only this
+# app's installer writes.
+#
+# The basename test is deliberately NOT a comparison against $OPENCONNECT:
+# measured, the kernel records the version-numbered Homebrew Cellar realpath
+# while the discovery loop above returns the /opt/homebrew/bin symlink, so an
+# equality check would refuse to stop the real tunnel, and the Cellar component
+# changes under `brew upgrade`. `*/openconnect` also rejects a bare relative
+# name, which no transport here produces — both of them exec openconnect by
+# absolute path.
+#
+# THREE signalling paths means three enforcement points and one shared
+# judgement. This one is what covers an OLD app on a NEW daemon: that app has no
+# identity filter of its own and still sends unverified pids here through sudo.
+#
+# What it does not claim: that the binary is trustworthy. It stops a root signal
+# aimed at an unrelated process — a recycled pid from a stale file, or a local
+# process that merely matched the argv regex.
+cmd_is_our_openconnect() {   # $1 = the full command line
+    case "$1" in *--cookie-on-stdin*) ;; *) return 1 ;; esac
+    case "$1" in *"--script=$ROUTE_WRAPPER"*) ;; *) return 1 ;; esac
+    case "${1%% *}" in */openconnect) return 0 ;; *) return 1 ;; esac
+}
+
 # Argument-protocol version. Bump whenever a subcommand's arguments change, so
 # an app paired with an older installed helper can detect the mismatch instead
 # of invoking it with arguments that mean something else.
@@ -932,6 +966,29 @@ case "$CMD" in
     stop)
         [ "$#" -ge 1 ] || die "usage: stop PID..."
         for p in "$@"; do case "$p" in *[!0-9]*|'') die "bad pid '$p'" ;; esac; done
+        # Identity BEFORE the signal, and after the numeric check so $p is safe to
+        # hand to ps. Each rejection is named BY NUMBER on stderr, which the app
+        # captures and logs, because that is the information a user needs to finish
+        # a stuck teardown by hand. The cost is stated rather than buried: an
+        # unreadable ps refuses everything and nothing is signalled at all. That is
+        # the fail-closed direction, and it is the one to be wrong in.
+        _keep=""
+        for p in "$@"; do
+            # 0 and 1 are never a tunnel, and `kill -INT 0` would signal this
+            # script's own process group.
+            if [ "$p" -le 1 ]; then
+                echo "refusing to signal pid $p: 0 and 1 are never a tunnel" >&2
+            elif cmd_is_our_openconnect "$("$PS" -ww -o command= -p "$p" 2>/dev/null)"; then
+                _keep="$_keep $p"
+            else
+                echo "refusing to signal pid $p: not our openconnect" >&2
+            fi
+        done
+        [ -n "$_keep" ] || die "no pid among $* could be established as our openconnect; nothing signalled"
+        # Word splitting is intended: _keep is a space-separated list of digits
+        # this loop built, not caller text.
+        # shellcheck disable=SC2086
+        set -- $_keep
         # SIGINT asks openconnect to tear the tunnel down gracefully, which
         # includes running the --script for "disconnect" to remove its routes.
         # Escalating on a fixed 2s timer interrupted that mid-spawn ("Failed to

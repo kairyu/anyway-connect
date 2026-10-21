@@ -467,6 +467,285 @@ extension NetReconcile {
         if let pid = pids.first(where: isAlive) { return .noop(alivePID: pid) }
         return .proceed
     }
+}
+
+// MARK: - What a stop attempt found and achieved
+
+/// Placed immediately after `NetReconcile.gate`, which is the precedent: this
+/// file is the "decisions, no I/O" layer compiled into BOTH targets, and `gate`
+/// is already a pure safety decision the harness drives from literals. The
+/// extension above is closed and reopened below rather than nesting this type,
+/// because the daemon, the app and the harness all name it bare.
+///
+/// PURE throughout: the observations go in and the verdict comes out, so every
+/// reply string is assertable without signalling a real process — which is the
+/// only way any of this can be tested on the machine it was written on.
+///
+/// Why it exists. `stopTunnel` used to reply `true` unconditionally: it replied
+/// "no tunnel running" when it had only failed to find one, and "stopped
+/// (escalated)" after a SIGTERM it never observed the result of. The app then
+/// deleted its endpoint record while openconnect was alive, its `pgrep` status
+/// poll found the tunnel 8 s later with no endpoint record to name it, and the
+/// menu settled on "Connected: ?".
+public enum TunnelStop {
+
+    /// What a candidate pid turned out to be. `.gone` is distinguished from
+    /// `.unknown` because `proc_pidpath` failing with `ESRCH` is INFORMATION —
+    /// the process exited between the liveness check and the probe — while any
+    /// other failure means the probe itself told us nothing.
+    public enum Identity: Equatable { case ourOpenconnect, notOurs, gone, unknown }
+
+    public struct Targets: Equatable {
+        /// Alive, and established as ours. These, and only these, get SIGINT.
+        public var signal: [Int32]
+        /// Alive and NOT established as ours. Never signalled, and never
+        /// evidence that nothing is running.
+        public var notOursLive: [Int32]
+        /// Alive, ours-or-not unknowable because the probe failed. Never
+        /// signalled, and never evidence that nothing is running.
+        public var unidentified: [Int32]
+        /// Named BY THE PID FILE and either gone or provably dead. The only
+        /// evidence that licenses removing that file.
+        public var stalePIDFile: [Int32]
+
+        public init(signal: [Int32] = [], notOursLive: [Int32] = [],
+                    unidentified: [Int32] = [], stalePIDFile: [Int32] = []) {
+            self.signal = signal
+            self.notOursLive = notOursLive
+            self.unidentified = unidentified
+            self.stalePIDFile = stalePIDFile
+        }
+    }
+
+    public enum Verdict: Equatable {
+        /// Nothing of ours was found alive. Nothing was signalled.
+        case nothingToStop(clearedStalePIDFile: Bool, notOursLive: [Int32])
+        /// Every signalled process was observed to exit. `escalated` means
+        /// SIGTERM was needed, so `vpnc-script`'s disconnect may have been cut
+        /// short. `unidentified` rides along because a stop that left a live
+        /// unidentifiable process behind has NOT established that nothing of
+        /// ours runs, and `isSuccess` keys on exactly that.
+        case stopped(pids: [Int32], escalated: Bool, unidentified: [Int32])
+        /// Signalled, and at least one survivor is alive at the end of the
+        /// bound. NOT a success.
+        case stuck(pids: [Int32], survivors: [Int32])
+        /// A live process was found and could not be established as ours, so it
+        /// was NOT signalled. NOT a success: something may be running.
+        case unidentified(pids: [Int32])
+    }
+
+    /// Does this pid look like OUR openconnect, strongly enough to send it
+    /// SIGINT as root? Three conjuncts, all required:
+    ///
+    ///   1. the caller can name the executable at all — for the daemon that is
+    ///      `proc_pidpath` succeeding, which also answers "does this process
+    ///      still exist" without a second syscall;
+    ///   2. that path names a file whose LAST COMPONENT is exactly
+    ///      `openconnect`;
+    ///   3. the argv carries BOTH of this app's markers: `--cookie-on-stdin`
+    ///      and `--script=<the installed route-wrapper.sh absolute path>`.
+    ///
+    /// (2) is a basename check and deliberately NOT an equality against
+    /// `findOpenconnect()`'s answer. Measured read-only on this machine: the
+    /// kernel records `/opt/homebrew/Cellar/openconnect/9.21/bin/openconnect`
+    /// while the candidate list returns the `/opt/homebrew/bin` symlink, and the
+    /// Cellar component carries a version that changes under `brew upgrade`. An
+    /// equality check would REFUSE TO STOP THE REAL TUNNEL; resolving both sides
+    /// through `realpath` would refuse a tunnel that was running when the binary
+    /// was upgraded. A regex match on a command line is detection, not
+    /// verification — the property required is "establish that it is genuinely
+    /// our tunnel", and (3) is what establishes it.
+    ///
+    /// A path separator is required, so argv[0] has to be the absolute path it
+    /// is on every transport here (the daemon and the sudo helper both exec
+    /// openconnect by absolute path). That is also exact parity with the
+    /// helper's `cmd_is_our_openconnect`, whose `*/openconnect` pattern cannot
+    /// match a bare name; one predicate across three signalling paths is worth
+    /// more than accepting a form this project never produces.
+    ///
+    /// (3) is the load-bearing conjunct and is STRICTER than the `pgrep`
+    /// pattern, which accepts EITHER marker. The script path is a root-owned
+    /// file in a root-owned directory that only this app's installer writes,
+    /// asserted root-owned before every connect.
+    ///
+    /// What this does NOT claim: that the binary is trustworthy. It is a
+    /// user-writable Homebrew install which the daemon ALREADY execs as root.
+    /// This check is not trying to be stronger than that existing trust — it
+    /// stops a root SIGINT aimed at an unrelated process: a recycled pid from a
+    /// stale file, or a local process that merely matched the argv regex. A
+    /// local user can forge argv and a basename, and the consequence is that
+    /// their own process receives signals they could already send it. The
+    /// security boundary is the listener's per-connection code-signing
+    /// requirement, which is not weakened by anything here.
+    public static func isOurOpenconnect(execPath: String, command: String,
+                                        scriptPath: String) -> Bool {
+        guard !execPath.isEmpty, !command.isEmpty, !scriptPath.isEmpty else { return false }
+        guard execPath.contains("/"),
+              execPath.split(separator: "/").last.map(String.init) == "openconnect"
+        else { return false }
+        guard command.contains("--cookie-on-stdin") else { return false }
+        return command.contains("--script=" + scriptPath)
+    }
+
+    /// Classify every candidate by its STATE and by the SOURCE it came from —
+    /// the same pid state means different things depending on where the number
+    /// was read, and collapsing the two is what made an earlier revision of this
+    /// fix unable to clear the very pid file whose staleness caused the incident.
+    ///
+    /// The source-keyed rules:
+    ///
+    ///   * `<= 1` from any source is dropped. `kill(0, SIGINT)` signals the
+    ///     daemon's own PROCESS GROUP, and `pid_t("0")` parses, so this is a real
+    ///     hole rather than a hypothetical one.
+    ///   * a PID-FILE entry that is not alive is `stalePIDFile`: the file names a
+    ///     dead process, so it IS stale. This is the observed input.
+    ///   * a PGREP entry that is not alive is dropped. That output is a snapshot,
+    ///     and a pid that exited in between is evidence of nothing.
+    ///   * an alive pid equal to the in-memory handle is `signal` with NO
+    ///     `identify` call: the daemon spawned it and holds the `Process`.
+    ///   * otherwise `identify` decides, and a `.notOurs` or `.unknown` pid that
+    ///     is still alive is never signalled and never counted as absence.
+    ///
+    /// A dead in-memory handle does not claim the pid, so the pid file can still
+    /// report it as stale.
+    public static func targets(inMemory: Int32?, pidFile: [Int32], pgrep: [Int32],
+                               isAlive: (Int32) -> Bool,
+                               identify: (Int32) -> Identity) -> Targets {
+        enum Source { case inMemory, file, scan }
+        var candidates: [(pid: Int32, source: Source)] = []
+        if let inMemory { candidates.append((inMemory, .inMemory)) }
+        candidates += pidFile.map { ($0, .file) }
+        candidates += pgrep.map { ($0, .scan) }
+
+        var t = Targets()
+        var claimed = Set<Int32>()
+        for (pid, source) in candidates {
+            guard pid > 1, !claimed.contains(pid) else { continue }
+            let alive = isAlive(pid)
+
+            if source == .inMemory {
+                guard alive else { continue }
+                claimed.insert(pid)
+                t.signal.append(pid)
+                continue
+            }
+            claimed.insert(pid)
+            guard alive else {
+                if source == .file { t.stalePIDFile.append(pid) }
+                continue
+            }
+            switch identify(pid) {
+            case .ourOpenconnect:
+                t.signal.append(pid)
+            case .gone:
+                if source == .file { t.stalePIDFile.append(pid) }
+            case .notOurs:
+                t.notOursLive.append(pid)
+            case .unknown:
+                // The argv probe timing out says nothing about liveness, so ask
+                // again rather than reporting a pessimistic verdict about a
+                // process that has since exited.
+                if isAlive(pid) {
+                    t.unidentified.append(pid)
+                } else if source == .file {
+                    t.stalePIDFile.append(pid)
+                }
+            }
+        }
+        t.signal.sort(); t.notOursLive.sort()
+        t.unidentified.sort(); t.stalePIDFile.sort()
+        return t
+    }
+
+    /// `found` — the signalled set; `escalated` — still alive after the SIGINT
+    /// wait; `survivors` — still alive after the SIGTERM wait.
+    ///
+    /// Precedence, because the inputs are three observations of a racing system:
+    /// nothing signalled but something unidentified is `.unidentified`; a
+    /// survivor is `.stuck`.
+    public static func verdict(found: [Int32], escalated: [Int32], survivors: [Int32],
+                               unidentified: [Int32], notOursLive: [Int32],
+                               clearedStalePIDFile: Bool) -> Verdict {
+        // survivors ⊆ escalated ⊆ found, enforced by CLAMPING in that order and
+        // NOT by trapping: this runs in a root daemon on a teardown path, where a
+        // precondition failure would abort the teardown. Everything is sorted
+        // before it can reach a message, so the strings are stable.
+        let f = found.sorted()
+        let e = escalated.filter(f.contains).sorted()
+        let s = survivors.filter(e.contains).sorted()
+        let u = unidentified.sorted()
+        let n = notOursLive.sorted()
+
+        guard !f.isEmpty else {
+            if !u.isEmpty { return .unidentified(pids: u) }
+            return .nothingToStop(clearedStalePIDFile: clearedStalePIDFile, notOursLive: n)
+        }
+        if !s.isEmpty { return .stuck(pids: f, survivors: s) }
+        return .stopped(pids: f, escalated: !e.isEmpty, unidentified: u)
+    }
+
+    /// ONE function for the daemon's log line and for the XPC reply, so the two
+    /// cannot drift. The baseline string is "no tunnel of ours running" in every
+    /// arm: the old `no tunnel running` asserted something about the whole
+    /// machine that this code is in no position to claim.
+    public static func message(_ verdict: Verdict) -> String {
+        switch verdict {
+        case .nothingToStop(let cleared, let notOursLive):
+            var m = "no tunnel of ours running"
+            if cleared { m += " (cleared a stale pid file)" }
+            if !notOursLive.isEmpty {
+                m += " (left \(list(notOursLive)) alone: "
+                   + "a live openconnect that is not ours)"
+            }
+            return m
+        case .stopped(let pids, let escalated, let unidentified):
+            var m = "stopped \(list(pids))"
+            if escalated { m += " (escalated to SIGTERM)" }
+            if !unidentified.isEmpty {
+                m += " (left \(list(unidentified)) unidentified — "
+                   + "NOT established as absent)"
+            }
+            return m
+        case .stuck(_, let survivors):
+            // The SURVIVORS, not the whole signalled set: naming a pid that did
+            // exit alongside one that did not is how a reader ends up chasing
+            // the wrong process.
+            let one = survivors.count == 1
+            return "found \(list(survivors)) and signalled \(one ? "it" : "them"), but "
+                 + "\(one ? "it is" : "they are") still running — NOT stopped"
+        case .unidentified(let pids):
+            return "live \(list(pids)) could not be identified as our openconnect — "
+                 + "NOT signalled and NOT stopped"
+        }
+    }
+
+    /// `.nothingToStop` stays a SUCCESS even with `notOursLive` non-empty:
+    /// nothing OF OURS is running, so the app's endpoint record names nothing and
+    /// clearing it is right. What changed is that the message no longer asserts
+    /// "no tunnel running" about a machine with a live openconnect-shaped process
+    /// on it.
+    ///
+    /// `.stopped` with a non-empty `unidentified` is NOT a success, and that
+    /// distinction is load-bearing: found `[42]` with unidentified `[99]` would
+    /// otherwise fall through as success, the app would clear its endpoint
+    /// record, `isRunning()`'s broad `pgrep` would match 99, and the menu would
+    /// read "Connected: ?" again.
+    public static func isSuccess(_ verdict: Verdict) -> Bool {
+        switch verdict {
+        case .nothingToStop: return true
+        case .stopped(_, _, let unidentified): return unidentified.isEmpty
+        case .stuck, .unidentified: return false
+        }
+    }
+
+    private static func list(_ pids: [Int32]) -> String {
+        pids.count == 1
+            ? "pid \(pids[0])"
+            : "pids \(pids.map(String.init).joined(separator: ", "))"
+    }
+}
+
+extension NetReconcile {
 
     /// The scope decision of `TunnelScope`, as one pure function over injected
     /// snapshots — so every arm of it is assertable from literals, with no live

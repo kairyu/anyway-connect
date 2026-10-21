@@ -332,13 +332,27 @@ final class PrivilegedClient {
         return result.0 ? .ok(result.1) : .refused(result.1)
     }
 
-    func stopTunnel() -> (ok: Bool, message: String) {
-        // Generous: the daemon waits up to 10s for a graceful teardown.
-        let result: (Bool, String)? = call(timeout: 20) { proxy, done in
+    /// 30s, derived rather than guessed: the daemon's worst case is `pgrep` 5s +
+    /// `ps` 3s (the rare arm) + the 10s SIGINT wait + the 5s SIGTERM wait = 23s,
+    /// plus two small file writes. PER CALL rather than for the first one only,
+    /// because stops run CONCURRENTLY in the daemon — `boundedTeardown(limit: 5)`
+    /// returns early by design, so a wake sequence and a menu Disconnect can
+    /// genuinely overlap, and serialising them would put 46s against this timeout.
+    ///
+    /// The ceiling is the disconnect step's 60s budget, whose arithmetic is written
+    /// out at AppDelegate.swift's `timeout`.
+    func stopTunnel() -> PrivilegedOutcome {
+        let result: (Bool, String)? = call(timeout: 30) { proxy, done in
             proxy.stopTunnel { ok, message in done((ok, message)) }
         }
-        guard let result = result else { return (false, "privileged daemon did not respond") }
-        return result
+        guard let result = result else {
+            return .unreachable("privileged daemon did not respond")
+        }
+        // `false` from THIS operation means "found something and did not stop it".
+        // stopTunnel takes no arguments, performs no validation and has no guard
+        // refusal, so there is no `.refused` to confuse it with — see the comment
+        // on the protocol declaration.
+        return result.0 ? .ok(result.1) : .failed(result.1)
     }
 
     func tunnelStatus() -> (running: Bool, pid: Int)? {
@@ -402,13 +416,22 @@ enum PrivilegedOutcome: Equatable {
     case ok(String)
     /// The daemon answered "no". Do NOT retry on another transport.
     case refused(String)
+    /// The daemon RAN the operation and it did not achieve its postcondition.
+    ///
+    /// Unlike `.refused` this is not an answer about the REQUEST, so a fallback
+    /// transport is legitimate — a stuck openconnect is precisely the case where
+    /// the sudo fallback is wanted, and in the observed incident the recovery was
+    /// the developer terminating it by hand. Unlike `.unreachable` the daemon is
+    /// reachable and healthy, so the transport cache must NOT be invalidated:
+    /// dropping it would discard a measurement for no reason.
+    case failed(String)
     /// Transport failure or timeout. Fall through, as before.
     case unreachable(String)
 
     /// The message, whichever arm this is — for logging, which never branches on it.
     var message: String {
         switch self {
-        case .ok(let m), .refused(let m), .unreachable(let m): return m
+        case .ok(let m), .refused(let m), .failed(let m), .unreachable(let m): return m
         }
     }
 }

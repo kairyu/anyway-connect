@@ -281,6 +281,16 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
     private static let observerQueue =
         DispatchQueue(label: "me.kairyu.anywayconnect.privhelper.observer")
 
+    /// ONE literal, because the reconcile gate ("do not touch routing") and the
+    /// stop ("what to signal") must agree about what an openconnect of ours
+    /// looks like. Its twin is `VPNRunner.openconnectPattern`; the harness
+    /// runner asserts there is exactly one occurrence of it in each file.
+    ///
+    /// Note it is weaker than `TunnelStop.isOurOpenconnect`, which requires BOTH
+    /// markers: this is the SCAN, and identity is established afterwards.
+    private static let openconnectPattern =
+        "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"
+
     // MARK: Preconditions
 
     /// Refuse to execute anything a non-root user could have edited. Everything
@@ -532,49 +542,184 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
         reply(true, "started pid \(task.processIdentifier)\(logNote)")
     }
 
+    /// Runs OFF the XPC handler thread and NOT under `mutationGate`.
+    ///
+    /// Off the gate: a stop must never be refused because a reconcile holds it. It
+    /// is safe without it — reconcile's own gate no-ops while an openconnect is
+    /// alive, and once one is dead this function only signals pids and removes two
+    /// small files.
+    ///
+    /// Off the handler thread: the body is now a `pgrep` (5 s), an optional `ps`
+    /// (3 s), a 10 s SIGINT wait and a 5 s SIGTERM wait, so running it inline would
+    /// head-of-line block the app's `version()` probes (1.5 s and 3 s) and flip the
+    /// transport to sudo in the middle of a teardown.
+    ///
+    /// CONCURRENT, not a serial queue of its own. Two stops can genuinely be in
+    /// flight: `handleWillSleep` calls `boundedTeardown(limit: 5)`, which returns on
+    /// expiry BY DESIGN and lets its `teardownNow()` carry on, and a wake sequence or
+    /// a menu Disconnect then issues a second `stopTunnel`. On a serial queue the
+    /// second would wait behind the first — 23 + 23 = 46 s against the client's
+    /// 30 s — and be reported as an unreachable daemon, dropping the transport cache
+    /// for a reason unrelated to the daemon's health.
+    ///
+    /// Concurrency cannot shorten the graceful window, which is the property the
+    /// signal sequence depends on: each stop waits its own 10 s from its own SIGINT,
+    /// so the earliest possible SIGTERM is still 10 s after the earliest SIGINT. A
+    /// late stop's SIGINT arriving mid-wait is harmless and cannot pull an
+    /// escalation forward. Everything else it touches is per-connection (`tunnel` is
+    /// an instance property of a per-connection service), idempotent (`kill` of a
+    /// gone pid is `ESRCH`, an absent file is the desired end state) or fenced
+    /// below.
     func stopTunnel(reply: @escaping (Bool, String) -> Void) {
-        let pids = knownPIDs()
-        guard !pids.isEmpty else { return reply(true, "no tunnel running") }
-
-        // SIGINT asks openconnect to tear the tunnel down gracefully, which
-        // includes running the route script for "disconnect" to remove its
-        // routes. Escalating on a fixed timer interrupted that mid-spawn
-        // ("Failed to spawn script ... Interrupted system call") and left routes
-        // behind, so wait for it and only escalate if genuinely stuck.
-        for pid in pids { kill(pid, SIGINT) }
-        var waited = 0.0
-        while waited < 10.0, pids.contains(where: { isAlive($0) }) {
-            usleep(250_000); waited += 0.25
-        }
-        let stubborn = pids.filter { isAlive($0) }
-        if !stubborn.isEmpty {
-            log("still alive after 10s, escalating to SIGTERM: \(stubborn)")
-            for pid in stubborn { kill(pid, SIGTERM) }
-        }
-        tunnel = nil
-        try? FileManager.default.removeItem(atPath: pidFilePath)
-        // TWO /var/run state files, and this path owns the lifetime of exactly ONE
-        // of them.
-        //
-        //   * netstate.json — "our tunnel may have left residue, and here is the
-        //     physical network it displaced". Removed HERE, and only here:
-        //     reconcile deliberately leaves it, because a later reconcile in this
-        //     boot can still use its install hint, and a stale advisory is already
-        //     fenced by the same-interface-and-subnet precondition and then by the
-        //     guard.
-        //   * tunnels.json — "utun7 was ours and it carried 192.168.204.16".
-        //     NEVER touched here, deliberately. It has to OUTLIVE the stop or a
-        //     lingering interface of ours can never be attributed, which is the one
-        //     repair the scope rule keeps. Its lifetime belongs to `startTunnel`
-        //     (unlink, then write) and to /var/run's pruning at boot.
-        //
-        // Conflating the two is the defect this split fixes: one file holding both
-        // meant a clean disconnect deleted the scope, so the next reconcile planned
-        // against every utun on the machine.
-        try? FileManager.default.removeItem(atPath: NetState.path)
-        reply(true, stubborn.isEmpty ? "stopped" : "stopped (escalated)")
+        DispatchQueue.global(qos: .userInitiated).async { self.stopNow(reply: reply) }
     }
 
+    private func stopNow(reply: @escaping (Bool, String) -> Void) {
+        let targets = TunnelStop.targets(
+            inMemory: tunnel?.isRunning == true ? tunnel?.processIdentifier : nil,
+            pidFile: pidsFromFile(),
+            pgrep: pgrepPIDs(),
+            isAlive: isAlive,
+            identify: { self.identifyPID($0) })
+
+        guard !targets.signal.isEmpty else {
+            // Nothing of ours is running. A pid file naming only gone-or-dead
+            // entries is removed; one naming a LIVE process — unidentifiable, or
+            // identified as somebody else's — is not, because the reply would
+            // otherwise claim a clear on evidence the file never carried.
+            //
+            // Note what this does NOT affect: the reconcile gate. `livePIDs()`
+            // unions the file with the `pgrep` scan, so a live foreign openconnect
+            // keeps the gate shut whether or not the file names it. The removal
+            // decision is about the truthfulness of the reply, not about the gate.
+            var cleared = false
+            if !targets.stalePIDFile.isEmpty,
+               targets.unidentified.isEmpty, targets.notOursLive.isEmpty {
+                cleared = removePIDFile(stoppedPIDs: [])
+            }
+            let verdict = TunnelStop.verdict(found: [], escalated: [], survivors: [],
+                                             unidentified: targets.unidentified,
+                                             notOursLive: targets.notOursLive,
+                                             clearedStalePIDFile: cleared)
+            cleanUpStateAfterStop(verdict, stoppedPIDs: [])
+            log("stop: \(TunnelStop.message(verdict))")
+            return reply(TunnelStop.isSuccess(verdict), TunnelStop.message(verdict))
+        }
+
+        // UNCHANGED signal sequence. SIGINT asks openconnect to tear the tunnel
+        // down gracefully, which includes running the route script for "disconnect"
+        // to remove its routes. Escalating on a fixed timer interrupted that
+        // mid-spawn ("Failed to spawn script ... Interrupted system call") and left
+        // routes behind, so wait for it and only escalate if genuinely stuck.
+        // NEVER SIGKILL: an interrupted vpnc-script is how this project produced
+        // orphaned routes and a stale DNS override.
+        for pid in targets.signal { kill(pid, SIGINT) }
+        var waited = 0.0
+        while waited < 10.0, targets.signal.contains(where: { isAlive($0) }) {
+            usleep(250_000); waited += 0.25
+        }
+        let escalated = targets.signal.filter { isAlive($0) }
+        if !escalated.isEmpty {
+            log("still alive after 10s, escalating to SIGTERM: \(escalated)")
+            for pid in escalated { kill(pid, SIGTERM) }
+            // The ONE addition to the sequence: a bounded wait AFTER the SIGTERM.
+            // Without it "did it exit" is unanswerable, and the old code simply
+            // assumed yes — which is how a process that survived both signals was
+            // still reported as "stopped (escalated)".
+            var termWaited = 0.0
+            while termWaited < 5.0, escalated.contains(where: { isAlive($0) }) {
+                usleep(250_000); termWaited += 0.25
+            }
+        }
+
+        let verdict = TunnelStop.verdict(found: targets.signal,
+                                         escalated: escalated,
+                                         survivors: escalated.filter { isAlive($0) },
+                                         unidentified: targets.unidentified,
+                                         notOursLive: targets.notOursLive,
+                                         clearedStalePIDFile: false)
+        tunnel = nil
+        cleanUpStateAfterStop(verdict, stoppedPIDs: targets.signal)
+        log("stop: \(TunnelStop.message(verdict))")
+        // A live process that is not ours cannot be carried by `.stuck`'s payload,
+        // so it is logged rather than lost. Log only — the reply and the log line
+        // both come from `TunnelStop.message`, so they cannot drift.
+        if !targets.notOursLive.isEmpty {
+            log("stop: left \(targets.notOursLive) alone — live openconnects that are not ours")
+        }
+        reply(TunnelStop.isSuccess(verdict), TunnelStop.message(verdict))
+    }
+
+    /// The single owner of both state-file removals, keyed to the verdict.
+    ///
+    /// The one removal that does not happen here is the `.nothingToStop` arm's,
+    /// because there its RESULT is an input to the verdict
+    /// (`clearedStalePIDFile`) and so has to happen before the verdict exists. It
+    /// goes through the same `removePIDFile(stoppedPIDs:)`, called with an empty
+    /// list — "remove it only if every pid it names is dead".
+    ///
+    /// TWO /var/run state files, and this path owns the lifetime of exactly ONE
+    /// of them.
+    ///
+    ///   * netstate.json — "our tunnel may have left residue, and here is the
+    ///     physical network it displaced". Removed HERE, and only here:
+    ///     reconcile deliberately leaves it, because a later reconcile in this
+    ///     boot can still use its install hint, and a stale advisory is already
+    ///     fenced by the same-interface-and-subnet precondition and then by the
+    ///     guard.
+    ///   * tunnels.json — "utun7 was ours and it carried 192.168.204.16".
+    ///     NEVER touched here, deliberately. It has to OUTLIVE the stop or a
+    ///     lingering interface of ours can never be attributed, which is the one
+    ///     repair the scope rule keeps. Its lifetime belongs to `startTunnel`
+    ///     (unlink, then write) and to /var/run's pruning at boot.
+    ///
+    /// Conflating the two is the defect that split fixes: one file holding both
+    /// meant a clean disconnect deleted the scope, so the next reconcile planned
+    /// against every utun on the machine.
+    private func cleanUpStateAfterStop(_ verdict: TunnelStop.Verdict,
+                                       stoppedPIDs: [pid_t]) {
+        switch verdict {
+        case .nothingToStop:
+            // The pid file was dealt with above. The netstate is LEFT ALONE: this
+            // stop found no tunnel of ours, so it has no evidence about whether a
+            // previous session's residue exists, and deleting a record on the
+            // strength of having observed nothing is the defect class this whole
+            // change is about.
+            break
+
+        case .stopped(_, let escalated, _):
+            _ = removePIDFile(stoppedPIDs: stoppedPIDs)
+            guard !escalated else {
+                log("netstate kept: the stop escalated to SIGTERM, so vpnc-script's "
+                    + "reason=disconnect may have been cut short — which is the exact "
+                    + "mechanism that produced this project's orphaned routes, and a "
+                    + "later reconcile needs the record to repair them")
+                return
+            }
+            // Only OUR session's netstate. The stop is asynchronous and the app's
+            // bounded teardown returns before it finishes, so a connect inside
+            // that window can have written a newer one — and unlinking that would
+            // silently cost the new session its install hint for the rest of the
+            // boot.
+            guard let state = NetState.load() else { return }
+            guard stoppedPIDs.contains(pid_t(state.tunnelPID)) else {
+                log("netstate kept: it names pid \(state.tunnelPID), which this stop did "
+                    + "not stop — a newer session wrote it")
+                return
+            }
+            try? FileManager.default.removeItem(atPath: NetState.path)
+
+        case .stuck, .unidentified:
+            // The pid file names a process that is still running, and the reconcile
+            // gate reads that file.
+            log("pid file and netstate kept: a process they name is still running")
+        }
+    }
+
+    /// NO CALLER today, and left on `knownPIDs()` unchanged on purpose. Were it
+    /// ever wired up, note the asymmetry documented on `isTunnelAlive()`: these
+    /// three discovery functions answer three different questions and must not be
+    /// "harmonised" into one.
     func tunnelStatus(reply: @escaping (Bool, Int) -> Void) {
         let pid = knownPIDs().first { isAlive($0) }
         reply(pid != nil, Int(pid ?? 0))
@@ -882,6 +1027,16 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
 
     private func isAlive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 }
 
+    /// DELIBERATELY left on `knownPIDs()` rather than widened to `livePIDs()`.
+    ///
+    /// This gates `startTunnel`'s "a tunnel is already running" refusal, and
+    /// widening it to an argv scan would let any process the desktop user can run
+    /// present a matching command line and block connecting. The asymmetry
+    /// between the three discovery functions is the enforcement, not an oversight:
+    ///
+    ///   `pgrep` evidence is trusted to say "do not touch routing". It is never
+    ///   trusted to say "you may not connect", and it is trusted to say "this is
+    ///   what to signal" only after `identifyPID` agrees.
     private func isTunnelAlive() -> Bool { knownPIDs().contains { isAlive($0) } }
 
     /// The in-memory handle is the fast path; the pid file covers the case where
@@ -890,11 +1045,75 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
     private func knownPIDs() -> [pid_t] {
         var pids: [pid_t] = []
         if let task = tunnel, task.isRunning { pids.append(task.processIdentifier) }
-        if let text = try? String(contentsOfFile: pidFilePath, encoding: .utf8),
-           let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        for pid in pidsFromFile() where !pids.contains(pid) { pids.append(pid) }
+        return pids
+    }
+
+    /// EVERY pid the file names, as a list rather than an optional, because
+    /// THREE writers share that one path: this daemon (`writePIDFile`),
+    /// openconnect itself through `--pid-file`, and the sudo helper through the
+    /// same flag. A partially-written or doubled file is therefore conceivable,
+    /// and with a single optional the stale-file / not-ours-live distinction in
+    /// `TunnelStop.targets` has an unreachable branch.
+    private func pidsFromFile() -> [pid_t] {
+        guard let text = try? String(contentsOfFile: pidFilePath, encoding: .utf8) else {
+            return []
+        }
+        var pids: [pid_t] = []
+        for field in text.split(whereSeparator: { $0.isNewline || $0 == " " }) {
+            guard let pid = pid_t(field.trimmingCharacters(in: .whitespaces)) else { continue }
+            // The floor lives HERE, at the parse, so `livePIDs()` and the stop
+            // both inherit it. `kill(0, SIGINT)` signals this daemon's own
+            // process group and `pid_t("0")` parses, and a 0 in that file also
+            // makes `kill(0, 0)` succeed — which would have left the reconcile
+            // gate reading "a tunnel is alive" for the rest of the boot. Logged
+            // because somebody writing 0 into a root-owned file is a real event.
+            guard pid > 1 else {
+                log("ignoring pid \(pid) from \(pidFilePath): 0 and 1 are never a tunnel")
+                continue
+            }
             if !pids.contains(pid) { pids.append(pid) }
         }
         return pids
+    }
+
+    /// The argv scan, as the daemon's only copy. `capture` is the shared bounded
+    /// runner (fixed absolute path, fixed PATH, 5 s, output capped, null stdin).
+    private func pgrepPIDs() -> [pid_t] {
+        capture("/usr/bin/pgrep", ["-f", Self.openconnectPattern], timeout: 5)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 1 }
+    }
+
+    /// Establish identity BEFORE signalling as root. `proc_pidpath` is evaluated
+    /// first because it carries the liveness answer and distinguishes `ESRCH`
+    /// ("it exited between the liveness check and here", which is information)
+    /// from a probe that is simply broken.
+    ///
+    /// `-ww` so the argv cannot be width-truncated. Measured, this tunnel's argv
+    /// is 264 bytes and both forms return all of it, but the `--script=` conjunct
+    /// would fail SILENTLY on a longer argv if it were ever clipped, and the flag
+    /// that removes the question costs nothing. `capture` yields "" on a non-zero
+    /// exit or a timeout, which is why the path probe comes first.
+    private func identifyPID(_ pid: pid_t) -> TunnelStop.Identity {
+        var buf = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else {
+            if errno == ESRCH { return .gone }
+            log("proc_pidpath(\(pid)) failed: \(String(cString: strerror(errno)))")
+            return .unknown
+        }
+        let command = capture("/bin/ps", ["-ww", "-o", "command=", "-p", String(pid)],
+                              timeout: 3)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            log("no argv for pid \(pid): identity cannot be established, so it is not signalled")
+            return .unknown
+        }
+        return TunnelStop.isOurOpenconnect(execPath: String(cString: buf),
+                                           command: command,
+                                           scriptPath: routeWrapperPath)
+            ? .ourOpenconnect : .notOurs
     }
 
     /// The reconcile gate's input, widened at the INPUT only — the pure gate itself is
@@ -907,22 +1126,50 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
     /// the sweep could run under a live tunnel.
     ///
     /// `pgrep` is the same judgement the app already makes, by the same pattern, so the
-    /// two cannot drift — and it can only make the gate MORE conservative. `capture` is
-    /// the shared bounded runner (fixed absolute path, fixed PATH, 5 s, output capped,
-    /// null stdin), so there is no second process helper here either.
+    /// two cannot drift — and it can only make the gate MORE conservative. One scan
+    /// implementation and one `> 1` floor, both inherited from `pgrepPIDs()` and
+    /// `pidsFromFile()`, so the gate and the stop cannot disagree about what they saw.
     private func livePIDs() -> [pid_t] {
-        var pids = Set(knownPIDs())
-        let out = capture("/usr/bin/pgrep",
-                          ["-f", "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"],
-                          timeout: 5)
-        pids.formUnion(out.split(whereSeparator: \.isNewline).compactMap {
-            pid_t($0.trimmingCharacters(in: .whitespaces))
-        })
-        return pids.sorted()
+        Set(knownPIDs()).union(pgrepPIDs()).sorted()
     }
 
     private func writePIDFile(_ pid: pid_t) {
         try? "\(pid)\n".write(toFile: pidFilePath, atomically: true, encoding: .utf8)
+    }
+
+    /// True iff the pid file is gone afterwards.
+    ///
+    /// Re-reads the file before unlinking, because the stop is asynchronous and the
+    /// app's bounded teardown returns before it finishes: a newer session's
+    /// openconnect may have rewritten this one shared path through `--pid-file` in
+    /// the meantime, and removing it then would blind the reconcile gate and
+    /// `isTunnelAlive()`'s connect refusal to a LIVE tunnel.
+    ///
+    /// An EMPTY `stoppedPIDs` therefore means "remove it only if every pid it
+    /// names is dead", which is exactly what the `.nothingToStop` arm wants.
+    private func removePIDFile(stoppedPIDs: [pid_t]) -> Bool {
+        let named = pidsFromFile()
+        guard !named.isEmpty else {
+            // Unreadable, absent, or naming nothing parseable. Absent is the
+            // desired end state and is reported as such; a file we cannot reason
+            // about is left alone rather than unlinked on no evidence.
+            return !FileManager.default.fileExists(atPath: pidFilePath)
+        }
+        let keep = named.filter { !stoppedPIDs.contains($0) && isAlive($0) }
+        guard keep.isEmpty else {
+            log("pid file kept: it names \(keep), which this stop did not stop")
+            return false
+        }
+        do {
+            try FileManager.default.removeItem(atPath: pidFilePath)
+            return true
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain,
+               nsError.code == NSFileNoSuchFileError { return true }
+            log("could not remove \(pidFilePath): \(error.localizedDescription)")
+            return false
+        }
     }
 
     /// Record what the physical network looked like before this tunnel existed.

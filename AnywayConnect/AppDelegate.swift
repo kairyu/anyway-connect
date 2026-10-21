@@ -1015,14 +1015,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ///
         /// A disconnect gets 60s, because nothing in that path waits for a person. Its
         /// worst case is `teardownNow()`'s own bounds added up: up to 3s probing the
-        /// privileged transport, up to 20s for the daemon's `stopTunnel` XPC call, then
-        /// on a daemon failure up to 5s for `helperIsUsable()` and ~10s in the shell
-        /// helper's `stop`, which SIGINTs openconnect, waits 10s and only then escalates
-        /// to SIGTERM — the daemon's own `stopTunnel` does the same. That is ~38s, so 60s
-        /// cannot fire on a merely slow teardown and still recovers the menu in about a
-        /// minute rather than four. Reusing 240s here would leave the user with no way
-        /// back for four minutes, which matters more now that the escape hatch is not
-        /// offered during a disconnect.
+        /// privileged transport, up to 30s for the daemon's `stopTunnel` XPC call
+        /// (`pgrep` 5s + `ps` 3s + the 10s SIGINT wait + the 5s SIGTERM wait = 23s in
+        /// the daemon, plus slack), then 3s for the batched `ps` that establishes which
+        /// discovered pids are ours, up to 5s for `helperIsUsable()` and ~10s in the
+        /// shell helper's `stop`, which SIGINTs openconnect, waits 10s and only then
+        /// escalates to SIGTERM — the daemon's own `stopTunnel` does the same. That is
+        /// 3 + 30 + 3 + 5 + 10 ≈ 51s, so 60s still cannot fire on a merely slow
+        /// teardown, with the margin roughly halved.
+        ///
+        /// Those last three terms used to describe a path that could not be taken: the
+        /// daemon's reply was unconditionally `ok`, so the daemon arm always returned
+        /// and the sudo fallback was unreachable after a daemon stop. It is REACHABLE
+        /// now — a stop that found something and did not stop it replies `.failed`, on
+        /// which the app keeps its endpoint record and falls through.
+        ///
+        /// Reusing 240s here would leave the user with no way back for four minutes,
+        /// which matters more now that the escape hatch is not offered during a
+        /// disconnect.
         var timeout: TimeInterval {
             switch self {
             case .connect:    return 240

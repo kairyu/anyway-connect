@@ -274,6 +274,44 @@ check "$(tunnels_in_scope "$(iface_snapshot)" none 'utun3 utun7 utun9' 2>/dev/nu
       "" \
       "case 20c none: nothing at all, whatever was seen"
 
+echo "== Test 9: cmd_is_our_openconnect — the shell twin of Suite 10 case 13 =="
+# No transport signals a pid it has not identified, and there are THREE
+# signalling paths: the daemon, the app's sudo fallback, and this arm's `stop`.
+# One shared judgement so they cannot disagree — and this arm is the one that
+# covers an OLD app on a NEW daemon, which has no identity filter of its own and
+# still sends unverified pids here through sudo.
+#
+# The PURE predicate only. The `stop` subcommand is never executed: the helper is
+# sourced with ANYWAY_HELPER_SOURCE_ONLY=1, so nothing here signals a process,
+# which is the only way this is testable at all under the task's constraints.
+#
+# $ROUTE_WRAPPER is the installed absolute path this arm itself passes to
+# openconnect, so these rows assert the same string the daemon's conjunct reads.
+ours() { if cmd_is_our_openconnect "$1"; then echo yes; else echo no; fi; }
+REAL_ARGV="/opt/homebrew/bin/openconnect --protocol=anyconnect --cookie-on-stdin \
+--timestamp --pid-file=/var/run/anyway-connect.pid --script=$ROUTE_WRAPPER -- vpn.example.com"
+check "$(ours "$REAL_ARGV")" "yes" \
+      "case 16a the real measured argv: accepted"
+check "$(ours "/opt/homebrew/Cellar/openconnect/9.21/bin/openconnect --cookie-on-stdin --script=$ROUTE_WRAPPER -- h")" \
+      "yes" \
+      "case 16b the Cellar realpath: accepted — an exec-path equality check would have refused it"
+check "$(ours "/bin/zsh --cookie-on-stdin --script=$ROUTE_WRAPPER -- h")" "no" \
+      "case 16c /bin/zsh: rejected whatever its argv says"
+check "$(ours "/usr/bin/openconnect-wrapper --cookie-on-stdin --script=$ROUTE_WRAPPER -- h")" \
+      "no" "case 16d openconnect-wrapper: the basename is not exactly openconnect"
+check "$(ours "openconnect --cookie-on-stdin --script=$ROUTE_WRAPPER -- h")" "no" \
+      "case 16e a bare relative name: rejected, as in the Swift predicate"
+check "$(ours "/opt/homebrew/bin/openconnect --protocol=anyconnect --script=$ROUTE_WRAPPER -- h")" \
+      "no" "case 16f argv missing --cookie-on-stdin"
+check "$(ours "/opt/homebrew/bin/openconnect --cookie-on-stdin -- h")" "no" \
+      "case 16g argv missing --script="
+check "$(ours "/opt/homebrew/bin/openconnect --cookie-on-stdin --script=/tmp/evil.sh -- h")" \
+      "no" "case 16h --script=/tmp/evil.sh: the marker is the INSTALLED path, not any path"
+check "$(ours "grep openconnect --cookie-on-stdin --script=$ROUTE_WRAPPER")" "no" \
+      "case 16i a grep for openconnect is not an openconnect"
+check "$(ours "")" "no" \
+      "case 16j the empty command line — an unreadable ps refuses, it never accepts"
+
 echo ""
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

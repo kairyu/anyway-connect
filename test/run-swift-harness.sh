@@ -154,17 +154,22 @@ echo "static: the daemon's only SIGKILL is the bounded runner's overrun kill"
 # ── Gate 4: ONE pgrep pattern literal per binary ────────────────────────────
 #
 # -F because the Swift source carries a doubled backslash that a BRE would not
-# match. A WARNING rather than a failure at this point in the change set:
-# VPNRunner.swift legitimately holds TWO copies (:271 and :1067) until the
-# defect-1 work hoists the second into a single constant. FLIP THIS TO A HARD
-# FAILURE in that step, and delete this paragraph with it.
+# match.
+#
+# A HARD FAILURE now that the defect-1 work has hoisted VPNRunner.swift's second
+# copy into `VPNRunner.openconnectPattern`. Both binaries must carry exactly one,
+# because the reconcile gate ("do not touch routing"), the app's status poll and
+# the stop ("what to signal") all have to agree about what an openconnect of ours
+# looks like — and the stop now FILTERS what the scan finds, so a drifted pattern
+# would mean scanning for one thing and filtering for another.
 for f in AnywayConnectHelper/main.swift AnywayConnect/VPNRunner.swift; do
     n=$(grep -cF 'route-wrapper\\.sh|--cookie-on-stdin' "$f")
     if [ "$n" != "1" ]; then
-        echo "WARNING: the openconnect pattern is not a single literal in $f (found $n)" >&2
+        echo "the openconnect pattern is not a single literal in $f (found $n)" >&2
+        exit 1
     fi
 done
-echo "static: pattern-literal count checked (warning only until the hoist)"
+echo "static: exactly one openconnect pattern literal per binary"
 
 # ── Compile ─────────────────────────────────────────────────────────────────
 mkdir -p "$D"

@@ -72,7 +72,18 @@ Layout, top to bottom:
 2. **Profile** and, when connected, the **gateway host** it actually reached.
 3. **Stop Connecting** — only while busy, and the only enabled row then. Without
    it a connect that never finished left no way out but quitting.
-4. **Disconnect** when connected, otherwise a "Connect to" header.
+4. **Disconnect** when connected, otherwise a "Connect to" header. A stop that
+   cannot stop the tunnel now **says so and keeps the connection's record**,
+   instead of reporting success and leaving the menu reading "Connected: ?" —
+   which is what happened when the record was cleared while `openconnect` was
+   still alive and the next status poll found the tunnel with nothing to name it.
+   The rule behind it, in general form: **no transport signals a process it has
+   not identified**. So Disconnect will stop an `openconnect` the app did not
+   start — one left by an earlier session, or started over a different backend —
+   but only after confirming that it is one, by the markers this app passes it;
+   and it **names in the log any process it refuses to signal**, because that is
+   what you need to finish the teardown by hand. The cost is stated rather than
+   hidden: if that confirmation cannot be made, nothing is signalled at all.
 5. **Endpoints** — favourites if any are marked, otherwise all of them. An "All
    endpoints" submenu appears only when it would reveal something not already
    listed. Only the endpoint in use is marked, with a tick; one being connected
@@ -298,8 +309,16 @@ address from the live system rather than being told one. It:
 
 It **refuses to do anything at all while a tunnel process is alive** — judged
 from both the pid file and a process scan, not from the pid file alone — so a
-healthy session is never disturbed. It runs at app launch, on wake, and on a
-network change, and every plan entry and its outcome goes to the daemon log.
+healthy session is never disturbed. That same process scan is what lets
+**Disconnect stop a tunnel the daemon did not start**: the pid file goes stale
+(`openconnect` removes it on its own graceful exit, and a tunnel started over
+another backend was never in it), so a stop that read only that file would find
+nothing and report that nothing was running. The scan finds it, the identity
+check establishes that it is one of ours, and only then is it signalled. The two
+uses of the scan are deliberately not symmetric: it is trusted to say "do not
+touch routing", never "you may not connect", and "this is what to signal" only
+after the identity check agrees. It runs at app launch, on wake, and on a network
+change, and every plan entry and its outcome goes to the daemon log.
 
 #### Which tunnels it will touch
 

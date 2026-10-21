@@ -259,6 +259,10 @@ enum Suite12Scope {
             abort: nil,
             installCandidateNote: "routeTable 10.0.1.1; netstateAdvisory none")
 
+        // `utun9`'s dropped default is the UNSCOPED one, so the install clause (f)
+        // emitted on the strength of that deletion goes with it: the composition of
+        // finding 8's drop with finding 6's withholding, which is the seam between
+        // the two and the one case neither finding states on its own.
         let revived = NetReconcile.dropRevivedTunnelActions(planned, present: ["en0", "utun9"])
         H.eqList(revived.plan.actions,
                  [.removeConfigdKey("State:/Network/Service/utun7/DNS"),
@@ -266,19 +270,42 @@ enum Suite12Scope {
                   .deleteStalePhysicalDefaultRoute(netif: "en0", ifscoped: true,
                                                    reason: .gatewayOffLink),
                   .deleteRoute(RouteDeletion(destination: "100.64.5.10",
-                                             netmask: nil, ifscope: nil)),
-                  .installDefaultRoute(interface: "en0")],
+                                             netmask: nil, ifscope: nil))],
                  "finding 8: a utun that REAPPEARED loses its keys and its default route")
-        H.eq(revived.dropped.count, 3, "finding 8: three drops, one per dropped action")
+        H.eq(revived.dropped.count, 4, "finding 8: three drops, plus the install they invalidate")
         H.ok(revived.dropped.allSatisfy { $0.contains("utun9") },
              "finding 8: and each names the tunnel that came back")
-        H.eqList(revived.plan.kept, planned.kept, "finding 8: `kept` is untouched")
-        H.eq(revived.plan.installCandidateNote, planned.installCandidateNote,
-             "finding 8: and so is the install note — only actions are filtered")
+        H.eqList(revived.plan.kept,
+                 planned.kept + [.installWithheldForSurvivingDefault(netif: "utun9")],
+                 "the seam: the withholding is RECORDED, under (f)'s own case")
+        H.eq(revived.plan.installCandidateNote, nil,
+             "and the install note is cleared with it — nil when no install is emitted")
+        H.ok(revived.dropped.contains { $0.contains("installDefaultRoute withheld") },
+             "and the reason is logged, not inferred from a shorter action list")
+
+        // The mirror: the same revival, but the surviving default is `-ifscope`d.
+        // `route delete default -ifscope utun9` leaves `default` itself alone, so the
+        // slot the install needs is free and the install must STAND. Without this
+        // row, "drop the install whenever a tunnel came back" would pass too.
+        let scopedOnly = ReconcilePlan(
+            actions: [.deleteTunnelDefaultRoute(netif: "utun9", ifscoped: true),
+                      .installDefaultRoute(interface: "en0")],
+            kept: [], abort: nil,
+            installCandidateNote: "routeTable 10.0.1.1; netstateAdvisory none")
+        let scopedRevived = NetReconcile.dropRevivedTunnelActions(scopedOnly, present: ["en0", "utun9"])
+        H.eqList(scopedRevived.plan.actions, [.installDefaultRoute(interface: "en0")],
+                 "a SCOPED drop does not occupy the default slot, so the install stands")
+        H.eqList(scopedRevived.plan.kept, [],
+                 "and nothing is withheld, so nothing is recorded")
+        H.eq(scopedRevived.plan.installCandidateNote, scopedOnly.installCandidateNote,
+             "and the install note survives with the install it describes")
 
         let unchanged = NetReconcile.dropRevivedTunnelActions(planned, present: ["en0"])
         H.eqList(unchanged.plan.actions, planned.actions,
                  "finding 8: the ordinary case — nothing came back, nothing is dropped")
         H.eqList(unchanged.dropped, [], "finding 8: and nothing is logged")
+        H.eqList(unchanged.plan.kept, planned.kept, "finding 8: `kept` is untouched")
+        H.eq(unchanged.plan.installCandidateNote, planned.installCandidateNote,
+             "finding 8: and so is the install note")
     }
 }

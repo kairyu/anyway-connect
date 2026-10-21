@@ -801,14 +801,42 @@ extension NetReconcile {
     /// re-probe, and the filter is here rather than in the daemon so it is
     /// assertable from literals.
     ///
-    /// Only these two action kinds name a tunnel. The sweep is not
-    /// attribution-scoped at all — its rule is on-link-ness — and the install
-    /// names a physical link, so neither is filtered.
+    /// Only those two action kinds NAME a tunnel, so only they are matched against
+    /// `present`. The sweep is not attribution-scoped at all — its rule is
+    /// on-link-ness — so it is never filtered.
+    ///
+    /// The install is the exception, and it is filtered for a different reason: not
+    /// because it names a tunnel, but because dropping an UNSCOPED tunnel default
+    /// deletion puts the plan back into exactly the state clause (f) refuses to
+    /// install into. (f) emitted the install because that unscoped row was going to
+    /// be deleted; once the deletion is dropped the row survives, the kernel's
+    /// `default` slot stays occupied, and `route -n add default <gw>` can only
+    /// return EEXIST — which the apply issues bare and then reports as an install
+    /// regardless. So (f)'s precondition is re-checked here against the post-drop
+    /// action list and the withholding is recorded the same way, under the same
+    /// `installWithheldForSurvivingDefault`. Without this the composition of the
+    /// two filters reintroduces, at apply time, the false "install default …"
+    /// transcript line that (f) exists to remove.
+    ///
+    /// The routing outcome is unchanged either way — the add fails in both — so
+    /// this moves a transcript line from a false claim to a true one and nothing
+    /// else. In particular it does NOT re-run clause (g): a stale PHYSICAL default
+    /// deletion that (g) let stand because an install was emitted still executes
+    /// after that install is withheld here, which leaves the stale row deleted with
+    /// no replacement installed. That is the behaviour today as well (the install
+    /// already failed with EEXIST, silently), so nothing is made worse, but it is a
+    /// real gap in the documented "the removal and the install are one operation"
+    /// rule and closing it would change which routes a reconcile leaves behind.
     public static func dropRevivedTunnelActions(_ plan: ReconcilePlan,
                                                 present: Set<String>)
         -> (plan: ReconcilePlan, dropped: [String]) {
         var kept: [ReconcileAction] = []
         var dropped: [String] = []
+        // In action order, so the netif the withholding names is deterministic: a
+        // route table can hold more than one unscoped default row (the
+        // `unspecified-default` fixture holds three default rows), so "the revived
+        // one" has to be a defined choice rather than a set's first element.
+        var revivedUnscopedDefaults: [String] = []
         for action in plan.actions {
             switch action {
             case .removeConfigdKey(let key):
@@ -820,6 +848,7 @@ extension NetReconcile {
                 if present.contains(netif) {
                     dropped.append("\(netif) is live again: deleteTunnelDefaultRoute"
                                  + (ifscoped ? " -ifscope \(netif)" : " (unscoped)"))
+                    if !ifscoped { revivedUnscopedDefaults.append(netif) }
                     continue
                 }
             case .deleteStalePhysicalDefaultRoute, .deleteRoute, .installDefaultRoute:
@@ -829,6 +858,22 @@ extension NetReconcile {
         }
         var filtered = plan
         filtered.actions = kept
+        // Only an UNSCOPED drop occupies the slot: `route delete default -ifscope`
+        // removes that link's scoped row and leaves `default` itself alone, which is
+        // the same distinction (f) draws over `deletedUnscopedDefaultNetifs`.
+        if let netif = revivedUnscopedDefaults.first,
+           filtered.actions.contains(where: { if case .installDefaultRoute = $0 { return true }
+                                              else { return false } }) {
+            filtered.actions.removeAll { if case .installDefaultRoute = $0 { return true }
+                                         else { return false } }
+            filtered.kept.append(.installWithheldForSurvivingDefault(netif: netif))
+            // Cleared to keep `installCandidateNote`'s stated contract — nil when no
+            // install was emitted — so apply cannot log a gateway divergence for an
+            // install that is not in the plan any more.
+            filtered.installCandidateNote = nil
+            dropped.append("\(netif) is live again: installDefaultRoute withheld — "
+                         + "its unscoped default survives, so the install could only return EEXIST")
+        }
         return (plan: filtered, dropped: dropped)
     }
 

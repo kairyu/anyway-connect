@@ -334,6 +334,16 @@ up before a connect, during a session, or next week is treated identically,
 because the question asked is "is this interface alive, and is it the one we
 recorded?" rather than "was it on the list we wrote when we connected?".
 
+"Its interface no longer exists" is decided before any command runs, so the
+interface list is **read again immediately before the first one does**. A tunnel
+that came up inside that window keeps its resolver overrides and its default
+route, and the reconcile says which actions it dropped and why. If the install
+of a physical default was only possible because that tunnel's default route was
+going to be removed, the install is dropped with it and reported as withheld —
+the kernel's `default` slot is occupied again, so the install could only fail,
+and reporting it as done is the failure mode this whole section exists to
+prevent.
+
 #### What it stopped doing, and what that leaves behind
 
 This is a simpler rule than the one before it, and it repairs strictly less. The

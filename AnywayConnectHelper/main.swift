@@ -844,20 +844,6 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
             log("reconcile: gate=proceed, plan \(plan.actions.count) actions, "
                 + "\(plan.kept.count) kept, abort=\(plan.abort.map(String.init(describing:)) ?? "none")"
                 + (dryRun ? " [DRY RUN]" : ""))
-            // Only the kept entries that record a DECISION about scope or withholding.
-            // The per-route ones are the other hundred-odd and are already summarised by
-            // the count above; printing them all would bury the three that matter.
-            for kept in plan.kept {
-                switch kept {
-                case .foreignTunnel, .liveTunnelIdentityUnproven, .ambiguousInstallTarget,
-                     .installWithheldForSurvivingDefault, .physicalDefaultUnusable,
-                     .defaultDeletionsWithheld:
-                    log("reconcile:   \(kept)")
-                default:
-                    continue
-                }
-            }
-
             // "Absent from a usable snapshot ⇒ provably dead" was decided against the
             // CLASSIFICATION snapshot, and the deletes it authorises run after the
             // prologue. A third-party client coming up inside that window would have
@@ -868,6 +854,28 @@ final class PrivilegedService: NSObject, PrivilegedHelperProtocol {
             let fresh = Set(NetProbe.interfaces().map(\.name))
             let bounded = NetReconcile.dropRevivedTunnelActions(plan, present: fresh)
             for drop in bounded.dropped { log("reconcile:   dropped — \(drop)") }
+
+            // Only the kept entries that record a DECISION about scope or withholding.
+            // The per-route ones are the other hundred-odd and are already summarised by
+            // the count above; printing them all would bury the three that matter.
+            //
+            // Logged from the BOUNDED plan and after the drops, not from the plan as
+            // first built: the re-probe can add an
+            // `installWithheldForSurvivingDefault` of its own when it drops the
+            // unscoped tunnel-default deletion that (f)'s install depended on, and a
+            // withholding that is not logged is the same kind of silence this change
+            // set exists to remove. The counts on the summary line above stay
+            // plan-time; the `dropped —` lines account for the difference.
+            for kept in bounded.plan.kept {
+                switch kept {
+                case .foreignTunnel, .liveTunnelIdentityUnproven, .ambiguousInstallTarget,
+                     .installWithheldForSurvivingDefault, .physicalDefaultUnusable,
+                     .defaultDeletionsWithheld:
+                    log("reconcile:   \(kept)")
+                default:
+                    continue
+                }
+            }
 
             let transcript = self.applyReconcile(bounded.plan, dryRun: dryRun)
             // The full transcript always goes to the log; only the reply is capped.

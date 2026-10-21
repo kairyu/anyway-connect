@@ -770,13 +770,38 @@ indefinitely.
 The tests are hermetic — `mktemp`, the mock, no `HOME`, no sudo, no real
 `openconnect` — which is what lets CI run them unchanged.
 
-There is no unit-test target for the AppKit code. Behaviour there is verified by
-compiling throwaway harnesses against the real sources: copy every file in
-`AnywayConnect/` except `main.swift` into a scratch directory, add your own
-`main.swift` as the entry point (Swift only allows top-level statements in a file
-with that name), and build with `swiftc -O`.
+```
+sh test/test-onlink-guard.sh
+```
 
-Two rules learned the hard way:
+The on-link guard's case table, run against the POSIX sh port in
+`scripts/anyway-root-helper.sh`. The shell guard is a copy of, not a call into,
+`evaluateDefaultGateway`, so what keeps the two honest is one case table run
+against each arm asserting the same rejection-reason strings. Nothing live is
+touched: the helper is sourced with `ANYWAY_HELPER_SOURCE_ONLY=1` and its three
+command paths are pointed at `test/stub-*.sh`.
+
+```
+sh test/run-swift-harness.sh
+```
+
+There is no unit-test target for the AppKit code, so the pure decision layer —
+the on-link guard and the reconcile planner — is tested by compiling the real
+sources together with a committed entry point: every file in `AnywayConnect/`
+except `main.swift` (Swift allows top-level statements only in a file with that
+name, and the harness supplies its own) plus `test/harness/*.swift`, built with
+`swiftc -O` at the fixed scratch path `/tmp/anyway-scratch`.
+
+The suites are **committed**, at `test/harness/`. They used to be a throwaway
+scratch file, and losing it to a `/tmp` prune meant the recorded baseline could
+not be re-run at all. The expected route-sweep lists are re-derived from the
+checked-in `netstat` captures by `test/harness/derive-expected.sh`, which reads
+no Swift source, and the runner diffs that derivation against the committed
+lists before compiling — so the planner's answer and an independent derivation
+of it are pinned to each other rather than to themselves. See
+`test/harness/README.md`.
+
+Two rules learned the hard way, and enforced by the runner's static gates:
 
 - **Never let a harness reach `ConfigStore.shared`.** It resolves
   `~/.config/anyway-connect/config.json` in a private initialiser with no override,

@@ -4,9 +4,10 @@ Inputs for the pure decision layer of the network-resilience fix: the route-tabl
 parser (`NetReconcile.parseRouteTable`), the on-link guard
 (`evaluateDefaultGateway`) and the reconcile planner (`NetReconcile.plan`).
 
-There is no unit-test target in this project, so these are driven by the scratch
-Swift harness described in `.kiro/steering` (fixed path `/tmp/anyway-scratch`,
-binary `a`). They are checked in because the states they describe cannot be
+There is no unit-test target in this project, so these are driven by the Swift
+harness in `test/harness/`, compiled and run by `sh test/run-swift-harness.sh`
+at the fixed scratch path `/tmp/anyway-scratch` with the binary always named
+`a`. See `test/harness/README.md`. They are checked in because the states they describe cannot be
 reproduced on demand: one of them is a laptop that had been carried from one
 network to another with a dead tunnel still in its route table, and the reboot
 that fixed the machine destroyed the evidence.
@@ -226,7 +227,7 @@ The row is in **both** large tables on purpose: `carried-home` is `vpn-up` plus
 the home link's rows, and that relationship is what makes "the same table, a
 different network" the whole point of the pair.
 | `netstat-rn-inet.clean.txt`, `interfaces.clean.json` | an **unscoped** physical default via the live router, no `utun`, no dead gateway — a machine with nothing to repair |
-| `netstat-rn-inet.cap-exceeded.txt` | synthetic: 300 distinct destinations via a dead gateway. Driven with `interfaces.carried-home.json`, whose `en0` is on the same subnet as its on-link row |
+| `netstat-rn-inet.cap-exceeded.txt` | synthetic: 300 distinct destinations via a dead gateway. **It has no `interfaces.*.json` of its own and is paired with `interfaces.clean.json`** — recorded here and in `test/harness/derive-expected.sh`, which carries the same pairing so a script and this table cannot drift. `clean`'s `en0` is `192.168.1.42/24`, the same subnet as the fixture's on-link row and off-link from its `10.0.1.1` gateway, which is what makes all 300 destinations swept and the cap fire. (`interfaces.carried-home.json` gives the identical answer — its `en0` carries the same address — but it also carries three `utun`s that have nothing to do with this fixture, so the smaller snapshot is the one the harness uses.) |
 | `netstat-rn-inet.lingering-utun.txt`, `interfaces.lingering-utun.json` | `utun7` still addressed with no tunnel process, plus routes via a *second*, vanished utun address — the kept case and the swept case of the same shape |
 | `netstat-rn-inet.two-physical.txt`, `interfaces.two-physical.json` | synthetic: `en0` and `en1` both up and addressed, no default route — the ambiguous install target |
 | `netstat-rn-inet.two-tunnels.txt`, `interfaces.two-tunnels.json`, `scutil-keys.two-tunnels.txt` | synthetic: `utun0` and `utun7` each with a default route and a pair of configd keys — the third-party-VPN case. `utun0` carries **no IPv4**, which is the live shape of this machine's system tunnels, so it also pins that an IPv4-less link is present in the snapshot rather than omitted |
@@ -280,8 +281,49 @@ awk 'NR>4 { nif[$1] = nif[$1] " " $4 }
 ```
 
 The harness asserts the full ordered action list, not just its length, so a
-regression in either direction fails. The expected list is generated from the
-fixture by a reduction that re-implements the destination rules separately from
-the Swift code under test (the generator is a throwaway script; the committed
-artefact is the literal list inside the harness, which is what the two
-independent derivations above pin down).
+regression in either direction fails.
+
+**The generator is no longer a throwaway script.** It is committed at
+`test/harness/derive-expected.sh`, which re-implements the classification, the
+canonicalisation and the first-seen ordering from the fixture text and the
+paired `interfaces.*.json` — reading no Swift source and calling no planner —
+and its output is committed under `test/harness/expected/`.
+`test/run-swift-harness.sh` re-derives and diffs every one of those files
+**before** compiling, and the harness then asserts them against the planner
+element for element. So a planner change that moves a list fails the harness, a
+hand-edited expected file fails the diff, and a derivation that drifts fails
+both. The script's `--kept` mode prints the other side of the same
+classification — one line per row the sweep declines to delete, with the reason
+— so the `kept` multiset is asserted rather than counted.
+
+Running the unfiltered multi-netif `awk` above prints the three destinations
+listed there, exactly as documented, because they are outside the sweep. The
+runner therefore applies the sweep's own destination filters before the check,
+which is the form in which "every swept destination is on exactly one netif" is
+a true statement; it also cross-checks the derived list directly, since 118
+unscoped deletions beside 118 scoped ones is the same property stated as a count.
+
+### The other fixtures' derived counts
+
+Each is produced by `sh test/harness/derive-expected.sh <name>` and committed:
+
+| Fixture | Snapshot | Swept destinations | Deletions | Clause-(c) kept rows |
+|---|---|---|---|---|
+| `carried-home` | `carried-home` | 118 | 236 | 21 |
+| `vpn-up` | `vpn-up` | 0 | 0 | 138 |
+| `lingering-utun` | `lingering-utun` | 2 | 4 | 10 |
+| `clean` | `clean` | 0 | 0 | 8 |
+| `link-down` | `link-down` | 0 | 0 | 7 |
+| `no-default` | `no-default` | 0 | 0 | 7 |
+| `two-physical` | `two-physical` | 0 | 0 | 9 |
+| `two-tunnels` | `two-tunnels` | 0 | 0 | 8 |
+| `cap-exceeded` | `clean` | 300 (over the 256 cap) | 0 | 1 |
+
+`vpn-up` sweeping **nothing** is the discrimination test for the whole
+classifier, not a vacuous case: it is the same table as `carried-home` seen from
+the office LAN, where every gateway in it is reachable — `10.0.1.1` is on-link
+for `en0`, `10.0.1.22` is `en0`'s own address, and `192.168.204.16` is held by a
+live `utun7`. If the sweep ever produces an entry there, it is deleting a route
+that works. `cap-exceeded` lists 300 because the cap bounds **distinct swept
+destinations**; exceeding it aborts the sweep, so the expected deletion list is
+empty rather than truncated.

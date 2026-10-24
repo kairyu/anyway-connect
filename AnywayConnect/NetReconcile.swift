@@ -253,6 +253,20 @@ public enum ReconcileKept: Equatable {
     /// for some live interface — a vanished tunnel's address is swept, which is
     /// the common case after a dead tunnel (open issue O-1).
     case tunnelOnLinkGateway(String, via: String)
+    /// A route whose next hop sits INSIDE a live physical link's subnet but is not
+    /// itself an installable next hop: the link's own address, or that subnet's
+    /// network or broadcast address. FR-2.6c forbids deleting it — the gateway IS
+    /// on-link for a live interface — even though the guard would refuse to
+    /// install it. `why` is the guard's rejection reason, so a test can assert
+    /// which of the three it was.
+    ///
+    /// Recorded separately from `gatewayOnLink` rather than folded into it,
+    /// because the two answer different questions: that one says "a usable next
+    /// hop", this one says "an unusable next hop we are nonetheless not allowed to
+    /// delete". Also see §4.3(b): for a DEFAULT route these same three reasons
+    /// authorise deletion. That is not a contradiction — see the comment at the
+    /// sweep's classifier.
+    case gatewayInLiveSubnet(String, via: String, why: String)
     case unparsable(String)
     /// A default route on a non-tunnel interface that is UNSCOPED and whose next
     /// hop the guard accepts. The thing being protected, and the only thing that
@@ -304,10 +318,35 @@ public struct ReconcilePlan: Equatable {
     public var isEmpty: Bool { actions.isEmpty }
 }
 
+// THREE UNVERIFIED PLATFORM ASSUMPTIONS, recorded here because this is the type
+// that names every command they concern, and it compiles into both targets.
+//
+// None of them could be checked while this was written: the only machine available
+// was live on the VPN with ~122 static routes installed, and confirming any of the
+// three requires executing the very mutation it is an assumption about. They are
+// assumptions, not observations, and the first real exercise of them is a
+// reconcile the user runs deliberately on a machine of their choosing.
+//
+//  1. `route -n delete default -ifscope <iface>` removes exactly the row scoped to
+//     that interface, and never the unscoped default. The whole scoping split in
+//     `plan` rests on this: if it silently fell through to the unscoped row it
+//     would delete a working physical default while reporting a tunnel cleanup.
+//  2. `route -n add default <gw>` fails with EEXIST when a default already exists,
+//     rather than replacing it. Every add here is issued unconditionally and its
+//     status ignored on that basis (see the daemon's restore, which reports the
+//     branch it took instead of the exit status).
+//  3. `scutil remove <key>` on a key that is not present is harmless — it may
+//     report failure, but it neither removes anything else nor leaves the
+//     configd session in a state that breaks the remaining removals in the same
+//     open/close batch. The configd keys are read before the batch is built, so
+//     this only matters when a key disappears in between.
 public enum ReconcileCommand: Equatable {
     /// One scutil invocation for every configd key, stdin = "open\nremove K\n…\nclose\n".
+    /// Assumption 3 above: a key that vanished between the read and this batch is
+    /// not fatal to the rest of the batch.
     case scutil(stdin: String, keys: [String])
-    /// A single deterministic /sbin/route invocation, argv complete.
+    /// A single deterministic /sbin/route invocation, argv complete. Carries
+    /// assumptions 1 (the `-ifscope` deletions) and 2 (the adds) above.
     case route(argv: [String])
     /// The ONLY state-dependent command: delete the unscoped default repeatedly,
     /// but each time only while `route -n get default` still names this interface.
@@ -625,6 +664,23 @@ extension NetReconcile {
             // acceptance alone cannot express the lingering-utun case. Reusing it
             // means the sweep and the restore cannot drift: a gateway the guard would
             // refuse to install is exactly a gateway the sweep considers dead.
+            // CLASSIFIED ON A CLOSED LIST OF REASONS, never by exclusion. "Dead by
+            // default:" deleted a route whose next hop is INSIDE a live link's
+            // subnet — the link's own address (step 9 fires before the on-link test
+            // at step 10, so such a route never reaches it), the subnet's network
+            // address or its broadcast address — all three of which FR-2.6c forbids
+            // deleting, and the first of which survived or not depending on whether
+            // some OTHER link happened to share the subnet.
+            //
+            // WHY THIS IS NOT §4.3(b)'s RULE, and must not be "harmonised" with it:
+            // (b) deletes a DEFAULT route for exactly these reasons, and is right to.
+            // A default route is the one route whose destination guarantees that
+            // keeping a dead one blackholes the whole machine, and (b) never deletes
+            // one without installing a replacement in the same operation. The sweep
+            // has neither property: it deletes an exception route whose destination
+            // is some specific prefix, it installs nothing in its place, and FR-2.6c
+            // draws its line at on-link-ness rather than at usability. Same reasons,
+            // different rules, both deliberate.
             var verdictKept = false
             for iface in interfaces where isUsablePhysical(iface) {
                 switch evaluateDefaultGateway(candidate: gw.text,
@@ -639,7 +695,33 @@ extension NetReconcile {
                     // the intended behaviour and the common case after a dead tunnel.
                     kept.append(.tunnelOnLinkGateway(dst, via: gw.text))
                     verdictKept = true
-                default:
+                // The three in-subnet-but-unusable reasons, spelled out one arm
+                // each so the recorded `why` is the guard's own answer rather than
+                // a second derivation of it.
+                case .reject(.gatewayIsOwnAddress):
+                    kept.append(.gatewayInLiveSubnet(
+                        dst, via: gw.text,
+                        why: GatewayRejection.gatewayIsOwnAddress.rawValue))
+                    verdictKept = true
+                case .reject(.gatewayIsNetworkAddress):
+                    kept.append(.gatewayInLiveSubnet(
+                        dst, via: gw.text,
+                        why: GatewayRejection.gatewayIsNetworkAddress.rawValue))
+                    verdictKept = true
+                case .reject(.gatewayIsBroadcastAddress):
+                    kept.append(.gatewayInLiveSubnet(
+                        dst, via: gw.text,
+                        why: GatewayRejection.gatewayIsBroadcastAddress.rawValue))
+                    verdictKept = true
+                case .reject(.gatewayOffLink), .reject(.malformedGateway),
+                     .reject(.unspecifiedGateway), .reject(.malformedInterfaceName),
+                     .reject(.targetInterfaceMissing), .reject(.targetInterfaceUnconfigured),
+                     .reject(.targetInterfaceIsTunnel), .reject(.targetInterfaceDown):
+                    // Off-link for this link, or a verdict about the LINK rather
+                    // than the next hop (unreachable here: `isUsablePhysical` has
+                    // already excluded every one of those, and the name was taken
+                    // from the snapshot). Try the next link; a route nothing can
+                    // reach falls through to swept.
                     continue
                 }
                 break

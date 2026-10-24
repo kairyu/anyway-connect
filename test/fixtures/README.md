@@ -62,8 +62,9 @@ What the rewrite preserves, by construction:
   `100.68.0/16`, a three-octet print of a /16, the shape that made a naive
   octet-count cross-check wrong;
 - the prefix length of every row (`/4` … `/32` all still present);
-- the row count (139), the distinct-destination count (130) and all 9
-  destinations that appear in both scoped and unscoped form;
+- the row count (139 as captured; **140** since the review-fix pass added one
+  row, see below), the distinct-destination count (130 as captured, now **131**)
+  and all 9 destinations that appear in both scoped and unscoped form;
 - every flag string, gateway, netif and trailing `!`.
 
 The target space is **RFC 6598 `100.64.0.0/10`** (shared address space, assigned
@@ -204,9 +205,26 @@ the RFC 7042 documentation range (`0:0:5e:0:53:…`). The mDNS group address
 
 | File | Origin |
 |---|---|
-| `netstat-rn-inet.vpn-up.txt`, `ifconfig.vpn-up.txt`, `scutil-keys.vpn-up.txt` | captured live and renumbered: 139 rows, the unscoped `default → 192.168.204.16 utun7` beside the **scoped** `default → 10.0.1.1 en0`, the duplicate scoped/unscoped rows, the two `utun7` configd keys **and** the UUID service's two |
+| `netstat-rn-inet.vpn-up.txt`, `ifconfig.vpn-up.txt`, `scutil-keys.vpn-up.txt` | captured live and renumbered: 140 rows (139 captured + one added, below), the unscoped `default → 192.168.204.16 utun7` beside the **scoped** `default → 10.0.1.1 en0`, the duplicate scoped/unscoped rows, the two `utun7` configd keys **and** the UUID service's two |
 | `interfaces.vpn-up.json` | `[NetInterface]`, authored by hand from `ifconfig.vpn-up.txt` |
 | `netstat-rn-inet.carried-home.txt`, `interfaces.carried-home.json` | **the reported incident.** The captured table plus the home link's own rows (`192.168.1/24 link#15`, `192.168.1.42/32 link#15`, and one host route via the live router `192.168.1.1`), against a snapshot where `en0` is `192.168.1.42/24` and `utun7` is gone. The surviving `default 10.0.1.1 UGScIg en0` row is the blackhole |
+
+### Rows added by hand for FR-2.6c (the review-fix pass)
+
+Four synthetic host routes, added because nothing in the capture exercised a next
+hop that is *inside* a live link's subnet but is still not installable — the case
+the sweep used to delete in breach of FR-2.6c:
+
+| Row | In | Classified as |
+|---|---|---|
+| `10.0.1.77 → 10.0.1.22` | **both** tables | in `vpn-up` (`en0 = 10.0.1.22/24`) the gateway is en0's **own address** ⇒ kept; in `carried-home` (`en0 = 192.168.1.42/24`) it is simply off-link ⇒ swept, and it is the one destination N grew by |
+| `192.168.1.77 → 192.168.1.42` | `carried-home` | en0's own address at home ⇒ kept |
+| `192.168.1.88 → 192.168.1.0` | `carried-home` | the subnet's network address ⇒ kept |
+| `192.168.1.99 → 192.168.1.255` | `carried-home` | the subnet's broadcast address ⇒ kept |
+
+The row is in **both** large tables on purpose: `carried-home` is `vpn-up` plus
+the home link's rows, and that relationship is what makes "the same table, a
+different network" the whole point of the pair.
 | `netstat-rn-inet.clean.txt`, `interfaces.clean.json` | an **unscoped** physical default via the live router, no `utun`, no dead gateway — a machine with nothing to repair |
 | `netstat-rn-inet.cap-exceeded.txt` | synthetic: 300 distinct destinations via a dead gateway. Driven with `interfaces.carried-home.json`, whose `en0` is on the same subnet as its on-link row |
 | `netstat-rn-inet.lingering-utun.txt`, `interfaces.lingering-utun.json` | `utun7` still addressed with no tunnel process, plus routes via a *second*, vanished utun address — the kept case and the swept case of the same shape |
@@ -231,14 +249,20 @@ awk '
   $(col["Netif"]) == "lo0" { next }                               # FR-2.6b
   $(col["Destination"]) ~ /^(127|169\.254|22[4-9]|23[0-9]|255\.255\.255\.255)[\.\/]/ { next }
   $(col["Destination"]) ~ /^(127|169\.254)$/ { next }
-  $(col["Gateway"]) ~ /^192\.168\.1\.[0-9]+$/ { next }            # on-link for en0
+  $(col["Gateway"]) ~ /^192\.168\.1\.[0-9]+$/ { next }            # in en0's subnet
   { dst[$(col["Destination"])] = 1 }
   END { n = 0; for (d in dst) n++; print "N =", n }
 ' test/fixtures/netstat-rn-inet.carried-home.txt
 ```
 
-**N = 117**, and every swept destination appears on exactly one `netif`, so the
-expected action list is exactly **2N = 234** entries: one unscoped deletion plus
+Note that the gateway rule above is "in en0's subnet", not "a usable next hop":
+that IS the planner's rule (FR-2.6c keeps a route whose gateway is on-link for a
+live interface, whether or not the guard would install it), which is why the
+three `192.168.1.{42,0,255}`-gateway rows below are skipped here too.
+
+**N = 118** (117 before the four rows described above were added), and every swept
+destination appears on exactly one `netif`, so the expected action list is exactly
+**2N = 236** entries: one unscoped deletion plus
 one `-ifscope` deletion per distinct `netif` per destination. (`route delete -net
 X` removes only the unscoped entry; the interface-scoped duplicate survives it
 and still wins, which is why both are emitted.)

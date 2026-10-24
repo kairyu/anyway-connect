@@ -1,4 +1,8 @@
 import Foundation
+// F3: NWPathMonitor is the only interface-change notification that does not require
+// polling or a SystemConfiguration dynamic-store subscription. App-only — the daemon's
+// sources stay Foundation-only, which is why none of this lives in NetGuard.swift.
+import Network
 
 enum VPNState: Equatable {
     case disconnected
@@ -21,6 +25,12 @@ final class VPNRunner {
     let ssoPort = 29786
 
     private init() {
+        // Assigned here rather than inline because the coalescer needs the queue, and a
+        // property's default expression cannot read another property of the same object.
+        let q = DispatchQueue(label: "me.kairyu.anywayconnect.path", qos: .utility)
+        pathQueue = q
+        pathCoalescer = Coalescer(window: 3.0, maxDeferral: 10.0, queue: q)
+
         let home = FileManager.default.homeDirectoryForCurrentUser
         stateDir = home.appendingPathComponent(".config/anyway-connect/state", isDirectory: true)
         pidFile = stateDir.appendingPathComponent("openconnect.pid")
@@ -42,6 +52,13 @@ final class VPNRunner {
         // a connect; isBusy() is consulted because a connect launched in the first second
         // of app life would otherwise race a launch reconcile for no reason.
         DispatchQueue.global(qos: .utility).async { [self] in
+            // BEFORE the guards, deliberately: this is the first time the transport is
+            // measured, and the power deciders read the published snapshot rather than
+            // probing from the main thread (pass-5 MEDIUM 6). A tunnel that is already
+            // up skips the reconcile below but must not leave the snapshot unmeasured —
+            // a sleep arriving in the first seconds of app life would then decide on
+            // `.interactiveSudo` and do nothing.
+            refreshTransportSnapshot()
             guard !isBusy(), !isRunning() else { return }
             reconcileNow(reason: "launch")
         }
@@ -129,25 +146,71 @@ final class VPNRunner {
     }
 
     /// Cached briefly: choosing the transport can cost an XPC round trip, and the
-    /// connect sequence asks more than once.
-    private var cachedTransport: (value: PrivilegedTransport, at: Date)?
+    /// connect sequence asks more than once. Guarded by `stateLock` — F3 added three
+    /// threads that reach this (the launch dispatch, the path queue and the step
+    /// executor) while the main thread's connect/disconnect paths do the same.
+    private var cachedTransport: (value: PrivilegedTransport, at: Date)?    // stateLock
 
+    /// BLOCKS on a probe when the cache is cold: an XPC round trip, or a `sudo -n` exec.
+    /// Never call this from a notification handler — read `cachedTransportSnapshot()`
+    /// instead (pass-5 MEDIUM 6).
     func privilegedTransport() -> PrivilegedTransport {
+        stateLock.lock()
         if let cached = cachedTransport, Date().timeIntervalSince(cached.at) < 10 {
+            // Republished even on a cache hit, so the snapshot a notification handler
+            // reads is never older than the last transport decision anything made.
+            transportSnapshot = cached.value
+            stateLock.unlock()
             return cached.value
         }
+        stateLock.unlock()
+        // The probe stays OUTSIDE the lock: PrivilegedClient.isUsable() does a round trip
+        // with a 3s bound, and holding a lock across it would stall the main thread's
+        // connect path behind a path-queue probe. Two threads can race to measure and the
+        // later write wins — harmless, since both answers are freshly measured.
+        //
         // isUsable() checks registration state first, so this costs nothing
         // until the daemon is actually installed.
         let chosen: PrivilegedTransport
         if PrivilegedClient.shared.isUsable() { chosen = .daemon }
         else if helperIsUsable() { chosen = .sudoHelper }
         else { chosen = .interactiveSudo }
+        stateLock.lock()
         cachedTransport = (chosen, Date())
+        transportSnapshot = chosen
+        stateLock.unlock()
         return chosen
     }
 
-    /// Force re-evaluation, e.g. right after the user installs the daemon.
-    func invalidateTransportCache() { cachedTransport = nil }
+    /// Force re-evaluation, e.g. right after the user installs the daemon, or after a
+    /// transport proved unreachable mid-operation.
+    func invalidateTransportCache() {
+        stateLock.lock(); cachedTransport = nil; stateLock.unlock()
+    }
+
+    /// Last measured transport, readable from any thread without blocking.
+    ///
+    /// `nil` ⇒ nothing has measured yet, and the answer is the one that makes the power
+    /// deciders do NOTHING: on `.interactiveSudo` they emit an empty plan, so an event
+    /// arriving before the first probe completes is ignored rather than acted on with a
+    /// guess. The launch dispatch measures within the first moments of app life.
+    private var transportSnapshot: PrivilegedTransport?     // stateLock
+
+    func cachedTransportSnapshot() -> PrivilegedTransport {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return transportSnapshot ?? .interactiveSudo
+    }
+
+    /// Re-measure and republish. BLOCKS — call it from the launch dispatch or the path
+    /// queue, never from the main thread.
+    ///
+    /// Dropping the cache first is what makes this a measurement rather than a read: a
+    /// path change is exactly the moment a daemon that was unreachable ten seconds ago
+    /// may have come back, and the 10s cache would otherwise answer from before the move.
+    func refreshTransportSnapshot() {
+        invalidateTransportCache()
+        _ = privilegedTransport()
+    }
 
     /// Argument-protocol version this build speaks to the root helper.
     /// 3: `restore-default` takes an INTERFACE instead of a gateway, and `reconcile`
@@ -185,9 +248,14 @@ final class VPNRunner {
     // into a main-thread Bool from another thread is a plain data race — so the hand-off
     // is explicit and lock-protected instead.
 
-    /// One lock over VPNRunner's cross-thread mutable state. F3 extends what it covers;
-    /// for now it guards `busySnapshot` alone. The XPC probe stays OUTSIDE it —
-    /// `PrivilegedClient.isUsable()` does a round trip and must not be held under a lock.
+    /// One lock over ALL of VPNRunner's cross-thread mutable state: `busySnapshot`,
+    /// `cachedTransport`, `transportSnapshot` and `lastPrimary`. F3 adds three entry
+    /// points from threads that never touched this object before — the launch dispatch,
+    /// the path callback and AppDelegate's step executor — and they all reach the
+    /// transport while the main thread's connect/disconnect paths do the same.
+    ///
+    /// The XPC probe stays OUTSIDE it — `PrivilegedClient.isUsable()` does a round trip
+    /// and must not be held under a lock.
     private let stateLock = NSLock()
     private var busySnapshot = false            // stateLock
 
@@ -202,6 +270,128 @@ final class VPNRunner {
     func isRunning() -> Bool {
         !shellCapture("/usr/bin/pgrep", ["-f", "openconnect .*(route-wrapper\\.sh|--cookie-on-stdin)"])
             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: - Path monitor (F3)
+    //
+    // The reported incident needs something to NOTICE that the machine moved. Nothing in
+    // this app did: the 8s refresh() poll only ever asked "is openconnect alive", which
+    // is still true with every route pointing at a gateway two networks away.
+
+    private let pathQueue: DispatchQueue
+    private let pathMonitor = NWPathMonitor()
+    /// 3s quiet period, 10s ceiling: a Wi-Fi roam or a wake emits a burst of updates, and
+    /// reconciling per update would mean several privileged sweeps for one move.
+    private let pathCoalescer: Coalescer
+
+    /// The physical interface the last accepted path update named. `nil` until the first
+    /// observation, which is why `decidePathChange` has a `.record` verdict at all.
+    private var lastPrimary: String?            // stateLock
+
+    /// Set by AppDelegate in `applicationDidFinishLaunching`. Invoked on `pathQueue`,
+    /// i.e. NOT on main — the callee hops to main itself.
+    var onNetworkChange: ((_ newPrimary: String) -> Void)?
+
+    /// Started from AppDelegate, not from `init`: the handler calls back into AppDelegate,
+    /// so the app must be past launch before updates can arrive.
+    func startPathMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in self?.handlePathUpdate(path) }
+        pathMonitor.start(queue: pathQueue)
+    }
+
+    func stopPathMonitor() {
+        pathCoalescer.cancel()
+        pathMonitor.cancel()
+    }
+
+    private func handlePathUpdate(_ path: NWPath) {
+        let names = path.availableInterfaces.map(\.name)
+        stateLock.lock(); let previous = lastPrimary; stateLock.unlock()
+        // `state:` is an autoclosure, so currentState() — a pgrep through the UNTIMED
+        // shellCapture — runs only if the decision actually reaches the step that needs
+        // it, i.e. only on a genuine change of physical primary. A burst of updates for
+        // one move costs one read, not one per callback.
+        let decision = Self.decidePathChange(previousPrimary: previous,
+                                             availableInterfaces: names,
+                                             satisfied: path.status == .satisfied,
+                                             state: currentState(),
+                                             busy: isBusy())
+        switch decision {
+        case .record(let primary):
+            stateLock.lock(); lastPrimary = primary; stateLock.unlock()
+            NSLog("AnywayConnect: path primary recorded \(primary) interfaces=\(names)")
+        case .ignore(let why):
+            // NFR-7: every ignore is logged, with the full ordered interface list, so a
+            // wrong primary pick is visible in one line rather than inferred.
+            NSLog("AnywayConnect: path update ignored (\(why.rawValue)) interfaces=\(names)")
+        case .trigger(let primary):
+            stateLock.lock(); lastPrimary = primary; stateLock.unlock()
+            NSLog("AnywayConnect: path change \(previous ?? "-") -> \(primary) interfaces=\(names)")
+            pathCoalescer.submit { [weak self] in
+                guard let self else { return }
+                // On pathQueue, off main: re-measure the transport right before the
+                // handler reads the snapshot, since the move itself may have changed
+                // what is reachable.
+                self.refreshTransportSnapshot()
+                self.onNetworkChange?(primary)
+            }
+        }
+    }
+
+    /// Why a path update was not acted on. Raw values are the log text.
+    enum PathIgnore: String {
+        case unsatisfied, noPhysicalInterface, unchanged, busyOrConnecting
+    }
+
+    enum PathDecision: Equatable {
+        case trigger(primary: String)
+        case record(primary: String)      // first observation: remember, do not act
+        case ignore(PathIgnore)
+    }
+
+    /// Pure, and `static` so a harness reaches it without `VPNRunner.shared` — touching
+    /// that lazy static runs a real launch reconcile.
+    ///
+    /// `state` is an `@autoclosure` for cost, not for taste: it is evaluated only at step
+    /// 5, so the four cheap verdicts never pay for a subprocess. Callers pass a plain
+    /// value, including the harness.
+    static func decidePathChange(previousPrimary: String?,
+                                 availableInterfaces: [String],
+                                 satisfied: Bool,
+                                 state: @autoclosure () -> VPNState,
+                                 busy: Bool) -> PathDecision {
+        // 1. Nothing to re-dial onto, and Wi-Fi dropping for two seconds mid-roam must
+        //    not start a teardown.
+        guard satisfied else { return .ignore(.unsatisfied) }
+
+        // 2. The primary is the first NON-tunnel entry. Filtering INSIDE the pure
+        //    function is what makes "utun7 appears ⇒ no trigger" an assertion about
+        //    shipped logic rather than about the caller.
+        guard let primary = availableInterfaces.first(where: { !isTunnelLikeName($0) }) else {
+            return .ignore(.noPhysicalInterface)
+        }
+
+        // 3. A first observation is not a change.
+        guard let previous = previousPrimary else { return .record(primary: primary) }
+
+        // 4. Our own tunnel coming up or going down moves the path repeatedly without
+        //    moving the physical primary (FR-3.2).
+        if previous == primary { return .ignore(.unchanged) }
+
+        // 5. WITHOUT RECORDING, so a change ignored because we were mid-connect is seen
+        //    again on the next update instead of being swallowed.
+        if busy || state() == .connecting { return .ignore(.busyOrConnecting) }
+
+        return .trigger(primary: primary)
+    }
+
+    /// The name half of `NetInterface.isTunnelLike`, and only the name half: `NWPath`
+    /// hands out interface names, never flags, so the point-to-point test cannot apply
+    /// here. A deliberate copy rather than a call — `NetInterface` needs a snapshot this
+    /// code path has no reason to collect.
+    private static func isTunnelLikeName(_ name: String) -> Bool {
+        for p in ["utun", "ppp", "ipsec", "gif", "stf"] where name.hasPrefix(p) { return true }
+        return false
     }
 
     // MARK: - Auth-group discovery
@@ -281,7 +471,7 @@ final class VPNRunner {
         }
         DispatchQueue.global(qos: .userInitiated).async {
             if self.isRunning() {
-                if force { self.disconnectSync(); Thread.sleep(forTimeInterval: 1.0) }
+                if force { self.teardownNow(); Thread.sleep(forTimeInterval: 1.0) }
                 else {
                     DispatchQueue.main.async {
                         completion(ConnectResult(ok: false, message: "session already running"))
@@ -448,7 +638,7 @@ final class VPNRunner {
                 // on error, leaving the default route pointing at a dead tunnel
                 // = no network until reboot. Force teardown and restore the
                 // saved physical default route before the next attempt.
-                self.disconnectSync()
+                self.teardownNow()
                 self.restoreDefaultRoute(savedDefault)
                 self.appendLog("[anyway] attempt \(index + 1) failed\(rejected ? " (cookie rejected by this node)" : " (no tunnel confirmation)")")
                 if index + 1 < candidates.count { Thread.sleep(forTimeInterval: 1.0) }
@@ -845,12 +1035,17 @@ final class VPNRunner {
 
     func disconnect(completion: @escaping () -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            self.disconnectSync()
+            self.teardownNow()
             DispatchQueue.main.async { completion() }
         }
     }
 
-    private func disconnectSync() {
+    /// Bring the tunnel down and wait for it. Internal, not private, because F3's power
+    /// handlers need a teardown that is synchronous: a will-sleep observer has to finish
+    /// the work before the machine suspends, and `disconnect(completion:)`'s hop to main
+    /// would never run. Same body as before, under a name that says what callers use it
+    /// for — `disconnect(completion:)` still wraps it for the UI.
+    func teardownNow() {
         if privilegedTransport() == .daemon {
             let result = PrivilegedClient.shared.stopTunnel()
             appendLog("[anyway] privileged daemon stop: \(result.message)")
@@ -1256,4 +1451,67 @@ final class VPNRunner {
     }
 
     private func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+}
+
+/// Trailing-edge debouncer with a hard ceiling (FR-3.4).
+///
+/// Injectable rather than hard-coded so a harness can give it a 0.2s window instead of
+/// waiting three seconds per assertion; the production values live at the one call site.
+final class Coalescer {
+    private let window: TimeInterval
+    private let maxDeferral: TimeInterval
+    private let queue: DispatchQueue
+
+    private let lock = NSLock()
+    /// Bumped by every submit and by `cancel()`. A scheduled fire that no longer matches
+    /// has been superseded and returns without running — cheaper and less error-prone
+    /// than cancelling DispatchWorkItems, and it cannot leave two timers alive at once.
+    private var generation = 0                  // lock
+    private var pending: (() -> Void)?          // lock
+    private var burstStart: Date?               // lock
+
+    /// - Parameters:
+    ///   - window: quiet period after the LAST submit before the work runs.
+    ///   - maxDeferral: ceiling measured from the FIRST submit of a burst. Without it a
+    ///     roam that emits updates faster than `window` defers the work indefinitely —
+    ///     which is precisely the carry-home case this exists to serve.
+    ///   - queue: where the work runs. Never main: the work blocks on privileged calls.
+    init(window: TimeInterval, maxDeferral: TimeInterval, queue: DispatchQueue) {
+        self.window = window
+        self.maxDeferral = maxDeferral
+        self.queue = queue
+    }
+
+    /// Latest submission wins: the work is replaced, not queued, so a burst runs the most
+    /// recent view of the world exactly once.
+    func submit(_ work: @escaping () -> Void) {
+        let now = Date()
+        lock.lock()
+        pending = work
+        generation += 1
+        let mine = generation
+        if burstStart == nil { burstStart = now }
+        let ceiling = burstStart!.addingTimeInterval(maxDeferral)
+        lock.unlock()
+        let trailing = now.addingTimeInterval(window)
+        let delay = max(0, min(trailing, ceiling).timeIntervalSince(now))
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.fire(mine) }
+    }
+
+    func cancel() {
+        lock.lock()
+        generation += 1
+        pending = nil
+        burstStart = nil
+        lock.unlock()
+    }
+
+    private func fire(_ mine: Int) {
+        lock.lock()
+        guard mine == generation, let work = pending else { lock.unlock(); return }
+        pending = nil
+        burstStart = nil
+        lock.unlock()
+        work()
+    }
 }

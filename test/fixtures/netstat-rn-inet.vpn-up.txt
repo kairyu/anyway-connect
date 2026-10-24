@@ -9,6 +9,7 @@ default            10.0.1.1           UGScIg                en0
 10.0.1.1/32        link#15            UCS                   en0      !
 10.0.1.22/32       link#15            UCS                   en0      !
 10.0.1.51          10.0.1.1           UGHS                  en0       
+10.0.1.77          10.0.1.22          UGHS                  en0       
 100.64             10.0.1.1           UGSc                  en0       
 100.65             10.0.1.1           UGSc                  en0       
 100.66             10.0.1.1           UGSc                  en0       

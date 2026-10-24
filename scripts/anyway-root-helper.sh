@@ -659,6 +659,59 @@ EOF
     printf '%s\n' "$_pu_found"
 }
 
+# §4.3(b)'s narrow rule, ported for this transport (O-11): the first UNSCOPED
+# default on a non-tunnel link whose next hop the guard refuses FOR A REASON THAT
+# PROVES THE HOP CANNOT CARRY TRAFFIC. Prints "NETIF GATEWAY REASON" and returns
+# 0; returns 1 when there is no such row.
+#
+# The reason, not the refusal, is what authorises the deletion. The six below all
+# say the link is present, up and addressed and the hop still cannot work. Every
+# other refusal — targetInterfaceDown, targetInterfaceMissing,
+# targetInterfaceUnconfigured, malformedInterfaceName, malformedGateway (an
+# `-interface` default, gateway `link#N`) — describes the SNAPSHOT or the shape of
+# the row, not the next hop, and a link mid-DHCP or briefly down is the normal
+# state in the window a reconcile runs in. Those are left alone.
+#
+# WHY THIS LIST IS *NOT* THE SWEEP'S RULE, and must not be "harmonised" with it.
+# NetReconcile's sweep KEEPS a route whose gateway is a live link's own, network
+# or broadcast address (FR-2.6c), while this function names those same three
+# reasons as authorising deletion. Both are correct, because the routes differ:
+#   * a DEFAULT route is the one route whose destination means that keeping a dead
+#     one blackholes the entire machine, and it is deleted here only as the first
+#     half of "delete, then install a guarded replacement" — one operation, never
+#     a deletion on its own;
+#   * a swept exception route has a specific destination, gets no replacement, and
+#     FR-2.6c deliberately draws its line at on-link-ness rather than usability.
+# A future reader who makes the two lists agree breaks one requirement or the
+# other.
+stale_unscoped_default() {
+    _sd_snap="$1"; _sd_found=""
+    while read -r _sd_n _sd_s _sd_gw; do
+        [ -n "${_sd_n:-}" ] || continue
+        [ "$_sd_s" = "0" ] || continue            # a scoped row is not THE default
+        snapshot_is_tunnel "$_sd_snap" "$_sd_n" && continue   # step 2 owns those
+        # A hop the guard accepts is a working default and is never deleted —
+        # which is also what makes this safe to call after physical_default_usable
+        # has already said no such row exists.
+        gw_on_link_for "$_sd_n" "$_sd_gw" && continue
+        case "$GUARD_REASON" in
+            gatewayOffLink|gatewayIsTunnelAddress|gatewayIsOwnAddress|\
+unspecifiedGateway|gatewayIsNetworkAddress|gatewayIsBroadcastAddress)
+                _sd_found="$_sd_n $_sd_gw $GUARD_REASON"
+                break
+                ;;
+            *)
+                echo "kept the unscoped default via $_sd_gw on $_sd_n:" \
+                     "reject($GUARD_REASON) describes the link, not the next hop" >&2
+                ;;
+        esac
+    done <<EOF
+$(default_rows "$2")
+EOF
+    [ -n "$_sd_found" ] || return 1
+    printf '%s\n' "$_sd_found"
+}
+
 # Argument-protocol version. Bump whenever a subcommand's arguments change, so
 # an app paired with an older installed helper can detect the mismatch instead
 # of invoking it with arguments that mean something else.
@@ -802,12 +855,18 @@ case "$CMD" in
         # route, and install a guarded physical default.
         #
         # This arm deliberately does LESS than the daemon's reconcile (open issue
-        # O-7): there is no dead-gateway sweep, and no physical default is ever
-        # deleted. Porting the route-table parser and a mass deletion into POSIX
-        # sh would duplicate the riskiest code where the Swift harness cannot
-        # reach it. The three un-wedging essentials are all here, and because
-        # nothing physical is deleted, §4.3(g)'s "never delete a default that
-        # could carry traffic without installing one" holds trivially.
+        # O-7): there is no dead-gateway sweep. Porting the route-table parser and
+        # a mass deletion into POSIX sh would duplicate the riskiest code where
+        # the Swift harness cannot reach it.
+        #
+        # It DOES delete a stale unscoped physical default, narrowly
+        # (`stale_unscoped_default` above, O-11), because the alternative is worse
+        # than the asymmetry: with a carried-home `default 10.0.1.1 UGScg en0` in
+        # the slot, both `route add` calls fail with EEXIST and the machine stays
+        # blackholed. §4.3(g)'s "never delete a default that could carry traffic
+        # without installing one" holds here the same way it holds in the daemon:
+        # the deletion is guard-gated, and it happens immediately before the add
+        # that replaces it, in the same operation — never on its own.
         #
         # Diagnostics go to stderr; the final line of stdout is the sentinel.
         [ "$#" -eq 0 ] || die "usage: reconcile (takes no arguments)"
@@ -881,10 +940,13 @@ case "$CMD" in
         fi
 
         # 2. The tunnel's default route, deleted by SCOPING. A -ifscope'd row is
-        #    deleted by name, which is unambiguous; an unscoped row is deleted
-        #    only while the kernel still answers the unscoped default with that
-        #    interface, because `route -n delete default` names no interface and
-        #    would otherwise remove whatever happens to be there.
+        #    deleted by name, which is ASSUMED to hit exactly that scoped row and
+        #    never the unscoped default (assumption 1 in NetReconcile.swift's
+        #    ReconcileCommand comment — unverified, because confirming it means
+        #    running it); an unscoped row is deleted only while the kernel still
+        #    answers the unscoped default with that interface, because
+        #    `route -n delete default` names no interface and would otherwise
+        #    remove whatever happens to be there.
         _rc_ndel=0
         while read -r _rc_n _rc_s _rc_gw; do
             [ -n "${_rc_n:-}" ] || continue
@@ -918,10 +980,41 @@ EOF
             echo "physical default already usable ($USABLE); no install needed"
         elif TARGET="$(pick_install_target "$SNAP" "$TABLE")"; then
             if GW="$(derive_gateway "$TARGET")"; then
+                # The stale row that would otherwise make the add below a no-op
+                # EEXIST. Evaluated through the guard, deleted only for a reason
+                # that proves the hop cannot carry traffic, and only while the
+                # kernel still answers the unscoped default with that interface —
+                # `route -n delete default` names no interface, so without that
+                # check it would remove whatever happens to be in the slot.
+                if STALE="$(stale_unscoped_default "$SNAP" "$TABLE")"; then
+                    read -r _rc_sn _rc_sg _rc_sr <<EOF
+$STALE
+EOF
+                    _rc_cur="$(current_default_iface)"
+                    if [ "${_rc_cur:-}" = "$_rc_sn" ]; then
+                        route -n delete default >/dev/null 2>&1 || true
+                        echo "deleted the stale unscoped default via $_rc_sg on" \
+                             "$_rc_sn (reject($_rc_sr))" >&2
+                    else
+                        echo "left the unscoped default alone: the kernel answers" \
+                             "it with ${_rc_cur:-none}, not $_rc_sn" >&2
+                    fi
+                fi
+                # The scoped add keeps its `|| true`: its EEXIST is benign, and
+                # ordinary traffic does not use a scoped default anyway.
                 route -n add default "$GW" -ifscope "$TARGET" >/dev/null 2>&1 || true
-                # Unconditional; EEXIST is expected and ignored.
-                route -n add default "$GW" >/dev/null 2>&1 || true
-                echo "installed default via $GW ($TARGET)"
+                # THE install, and its status is NOT discarded. Reaching here means
+                # physical_default_usable found no usable unscoped default, so a
+                # failure now means the machine still has none — reporting "installed
+                # default via …" and then the ok sentinel would tell the app the
+                # network was repaired while it is still blackholed.
+                if route -n add default "$GW" >/dev/null 2>&1; then
+                    echo "installed default via $GW ($TARGET)"
+                else
+                    echo "route -n add default $GW FAILED and no usable unscoped" \
+                         "default exists — routing is NOT repaired" >&2
+                    _rc_why="could not install the unscoped default via $GW on $TARGET"
+                fi
             else
                 # FR-1.9: a refusal means routing is left exactly as it was.
                 echo "install REFUSED for $TARGET — no acceptable gateway" >&2

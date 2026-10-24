@@ -226,6 +226,88 @@ Off by default. When on, a dropped tunnel is redialled up to the configured
 number of times with the configured delay. A disconnect you asked for is never
 redialled — the two are distinguished explicitly rather than inferred.
 
+## Network changes, sleep and wake
+
+The reported failure was a laptop carried from the office to home: `openconnect`
+was still alive, so nothing noticed anything was wrong, while every route still
+pointed at a gateway on a network two hops away. The machine had no internet and
+the VPN did not come back.
+
+Three things now notice.
+
+**An interface watch.** `NWPathMonitor` reports the system's available interfaces;
+the first non-tunnel one is taken as the primary. A change of primary — and only
+a change of primary — is acted on, so the tunnel's own `utun` coming up or going
+down is not mistaken for a move. Updates are coalesced over a 3-second quiet
+period with a 10-second ceiling, because a Wi-Fi roam emits a burst of them and
+one move should cost one repair. Every update is logged, both the ones acted on
+and the ones deliberately ignored, with the reason and the full interface list.
+
+**Sleep.** Before the machine suspends, a connected tunnel is torn down *while
+the old network is still present*, which is what lets the disconnect script run
+against the gateway the routes were built for. That teardown is bounded at five
+seconds: macOS does not wait indefinitely for a sleep observer.
+
+**Wake, and a network change while connected.** A live tunnel is treated as dead
+rather than repaired — its routes belong to a network that is gone — then the
+privileged reconcile below runs, and only then is one re-dial attempted. The
+order matters: reconcile refuses to touch anything while the tunnel process is
+alive, so repairing first and reconciling after would reliably do nothing.
+
+Only one such sequence runs at a time. A carry-home produces a wake *and* a
+debounced path change, and the second one is dropped with a logged reason instead
+of being queued behind a repair that has already superseded it.
+
+**The honest outcome: notify, don't retry.** Exactly one re-dial is attempted,
+never more. Signing in goes through the browser, so an unattended attempt cannot
+complete on its own and five of them would only produce five notifications. With
+auto-reconnect off, or with no endpoint remembered, there is no attempt at all —
+just one notification. So after a carry-home you should expect **internet
+working, VPN down, one notification**, and the sign-in is yours to finish.
+
+That notification is only sent when something was actually lost: a tunnel this
+app had just torn down for the sleep or the network change. Waking a machine that
+was *already* disconnected repairs the network silently — no "VPN dropped" for a
+drop that never happened — and still re-dials if auto-reconnect is on and an
+endpoint is remembered, because a sleep can be the thing that removed the tunnel.
+A network change while already disconnected repairs and nothing more: nothing was
+torn down, so there is nothing to restore.
+
+### The privileged reconcile
+
+The repair itself needs root and runs privileged-side, where it derives every
+address from the live system rather than being told one. It:
+
+- removes the leftover `State:/Network/Service/<utun>/IPv4` and `/DNS` overrides
+  that keep DNS pointed at a tunnel that no longer exists;
+- removes a default route that still points at a `utun`;
+- deletes routes whose next hop is outside every live link's subnet, capped at
+  256 destinations per run so one pathological table cannot stall the machine. A
+  next hop that sits *inside* a live link's subnet is kept even when it could
+  never be installed as a gateway — the link's own address, or the subnet's
+  network or broadcast address — because the link that would carry it is present
+  and working;
+- installs a physical default route only when it can justify the next hop, and
+  leaves routing untouched when it cannot.
+
+It **refuses to do anything at all while a tunnel process is alive** — judged
+from both the pid file and a process scan, not from the pid file alone — so a
+healthy session is never disturbed. It runs at app launch, on wake, and on a
+network change, and every plan entry and its outcome goes to the daemon log.
+
+A stale physical default — the carried-home `default 10.0.1.1` on a `192.168.1.0/24`
+link — is removed on **both** backends, and only ever as the first half of
+"remove the dead one, install a guarded replacement": the removal and the install
+are one operation, never a removal on its own. If the install nevertheless fails,
+the reconcile reports a failure rather than claiming it repaired the network.
+
+One asymmetry worth knowing: on the **sudoers-helper** backend the reconcile does
+the un-wedging essentials (the configd keys, the tunnel default route, the stale
+physical default and the guarded replacement) but **does not sweep** dead-gateway
+routes. Porting a route-table parser and a mass deletion into POSIX shell would
+duplicate the riskiest code in the place it can be tested least. The daemon
+backend sweeps.
+
 ## LAN bypass
 
 "My local network" keeps your own subnet reachable while connected, and
@@ -238,6 +320,14 @@ One caveat found the hard way: the bundled `vpnc-script` sets `OverridePrimary`
 unconditionally — its own `#if`/`#fi` guard is commented out — and removing that
 silently converts a full tunnel into a split tunnel. Worth knowing before
 treating it as a knob.
+
+A second delta in the same copied script: its `get_default_gw()` can answer with
+a `utun`'s *own* address — exactly the value that blackholed the carried-home
+laptop — and its `set_vpngateway_route()` only ever `add`s a route. So
+`File exists` lines still appear in the log while `openconnect` runs its own
+`attempt-reconnect`, and that is untouched here. The reconcile above cleans up
+after it rather than preventing it; the app's own restore path no longer trusts a
+captured gateway address at all.
 
 ## Privileged backends
 
@@ -294,7 +384,16 @@ a root write anywhere on the filesystem. So the daemon:
 
 Both sides report a protocol version and the app refuses a daemon older than it
 expects, falling back to sudo rather than calling it with arguments that mean
-something else. The version is currently **1**, in step with the app's own 1.0.
+something else. The XPC protocol is now **2** and the shell helper's argument
+protocol **3**: restoring a default route takes an *interface* where it used to
+take a gateway address, and `reconcile` is new. Both were bumped because an
+argument changed meaning — an older install handed a bare interface name would
+read it as an address.
+
+The consequence is visible: until the backends are reinstalled from
+**Settings ▸ General**, an installed older daemon reports as outdated and an
+older shell helper is not used at all, so privileged work falls through to the
+password prompt. Reinstalling is the whole fix.
 
 Registration is judged by the state macOS ends in, not by what `register()`
 returned: the call can throw and still have created the registration, which
@@ -326,8 +425,10 @@ argument handling, and two rules follow:
    `brew upgrade openconnect` will not update the copy.
 
 Remaining arguments — protocol, host, fingerprint, resolve, exception routes,
-pids, gateway — are validated against strict patterns, and the host is passed
-after `--` so it can never be read as an option.
+pids, and the interface a default route is to be restored on — are validated
+against strict patterns, and the host is passed after `--` so it can never be
+read as an option. No gateway address is accepted from the app any more: the
+helper derives the next hop itself and refuses one it cannot justify.
 
 ## The session cookie
 

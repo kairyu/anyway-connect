@@ -147,6 +147,46 @@ else
     check "exit-non-zero" "exit-non-zero" "case 5  derive_gateway's exit status"
 fi
 
+echo "== Test 6: stale_unscoped_default — §4.3(b)'s narrow rule on this transport =="
+# The DECISION only. Nothing here runs `route`: the function reads a snapshot and a
+# table and prints "NETIF GATEWAY REASON" for the one row the reconcile arm may
+# delete immediately before installing its replacement.
+stale() {
+    if _t_out="$(stale_unscoped_default "$(iface_snapshot)" \
+                     "$("$NETSTAT" -rn -f inet)" 2>/dev/null)"; then
+        printf '%s\n' "$_t_out"
+    else
+        echo "-"
+    fi
+}
+
+STUB_SNAPSHOT=home; STUB_ROUTE_TABLE=carried-home
+check "$(stale)" "en0 10.0.1.1 gatewayOffLink" \
+      "case 1  the reported incident: the carried-home default authorises its deletion"
+STUB_ROUTE_TABLE=carried-scoped
+check "$(stale)" "-" \
+      "case 2  the same hop -ifscope'd is not THE default, so it is not deleted"
+STUB_ROUTE_TABLE=home-default
+check "$(stale)" "-" "case 3  a working default is never stale"
+STUB_ROUTE_TABLE=empty
+check "$(stale)" "-" "case 4  no table, no row to delete"
+
+STUB_SNAPSHOT=guard
+STUB_ROUTE_TABLE=own-address
+# The sweep KEEPS a route via this same address (FR-2.6c) while the default slot
+# treats it as deletable. Both are deliberate — see the comment on the function.
+check "$(stale)" "en0 10.0.1.22 gatewayIsOwnAddress" \
+      "case 5  en0's own address in the default slot"
+STUB_ROUTE_TABLE=tunnel-gw
+check "$(stale)" "en0 192.168.204.16 gatewayIsTunnelAddress" \
+      "case 6  the OBSERVED failure: a utun's address as a physical next hop"
+STUB_ROUTE_TABLE=down-link
+check "$(stale)" "-" \
+      "case 7  targetInterfaceDown describes the LINK, not the hop: kept"
+STUB_ROUTE_TABLE=interface-only
+check "$(stale)" "-" \
+      "case 8  an -interface default has no IPv4 next hop to judge: kept"
+
 echo ""
 echo "== RESULT: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

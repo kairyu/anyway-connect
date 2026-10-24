@@ -28,6 +28,23 @@ final class VPNRunner {
         endpointFile = stateDir.appendingPathComponent("endpoint")
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         sweepStaleCookies()
+        // Repair whatever a crash, a forced sleep or a network move left behind, before
+        // the user has a chance to notice there is no internet.
+        //
+        // Off-thread: app launch and menu-bar setup must never wait on a privileged
+        // round trip, and NOTHING waits on this dispatch — that is how its 90s worst
+        // case stays invisible. `self` is captured DIRECTLY and VPNRunner.shared must
+        // never be mentioned in here: naming the lazy static from inside its own
+        // initialiser re-enters it and deadlocks.
+        //
+        // The guards are cheap pre-checks, not the interlock. The daemon re-gates on
+        // tunnel liveness and its mutation gate is what actually serialises this against
+        // a connect; isBusy() is consulted because a connect launched in the first second
+        // of app life would otherwise race a launch reconcile for no reason.
+        DispatchQueue.global(qos: .utility).async { [self] in
+            guard !isBusy(), !isRunning() else { return }
+            reconcileNow(reason: "launch")
+        }
     }
 
     private var cfg: AppConfig { ConfigStore.shared.config }
@@ -133,7 +150,11 @@ final class VPNRunner {
     func invalidateTransportCache() { cachedTransport = nil }
 
     /// Argument-protocol version this build speaks to the root helper.
-    private let requiredHelperVersion = 2
+    /// 3: `restore-default` takes an INTERFACE instead of a gateway, and `reconcile`
+    /// is new. A version-2 helper called with a bare interface name would read it as
+    /// the gateway address and refuse — so an older install must fall through to the
+    /// prompt rather than be driven with arguments that mean something else.
+    private let requiredHelperVersion = 3
 
     /// True only if the installed helper is present, sudo-granted, and speaks a
     /// compatible argument protocol.
@@ -145,10 +166,37 @@ final class VPNRunner {
     func helperIsUsable() -> Bool {
         guard FileManager.default.isExecutableFile(atPath: rootHelper) else { return false }
         // -n: never prompt. A missing sudoers rule fails fast instead of hanging.
-        let out = shellCapture("/usr/bin/sudo", ["-n", rootHelper, "version"])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        //
+        // shellCaptureSplit with a bound, not shellCapture: this is now reached from the
+        // launch dispatch and from the reconcile path as well as from a connect, and
+        // shellCapture has no timeout at all — a `sudo` wedged on an unreachable LDAP
+        // lookup would hang whichever of those called it.
+        let r = shellCaptureSplit("/usr/bin/sudo", ["-n", rootHelper, "version"], timeout: 5)
+        guard !r.timedOut else { return false }
+        let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let version = Int(out) else { return false }
         return version >= requiredHelperVersion
+    }
+
+    // MARK: - Busy mirror
+    //
+    // AppDelegate owns the user-visible `busy` flag on the main thread. The launch
+    // reconcile below runs on a utility queue and has to consult it, and reaching back
+    // into a main-thread Bool from another thread is a plain data race — so the hand-off
+    // is explicit and lock-protected instead.
+
+    /// One lock over VPNRunner's cross-thread mutable state. F3 extends what it covers;
+    /// for now it guards `busySnapshot` alone. The XPC probe stays OUTSIDE it —
+    /// `PrivilegedClient.isUsable()` does a round trip and must not be held under a lock.
+    private let stateLock = NSLock()
+    private var busySnapshot = false            // stateLock
+
+    func setBusy(_ value: Bool) {
+        stateLock.lock(); busySnapshot = value; stateLock.unlock()
+    }
+
+    func isBusy() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }; return busySnapshot
     }
 
     func isRunning() -> Bool {
@@ -683,19 +731,34 @@ final class VPNRunner {
 
         // Daemon path: no shell, no temp cookie file, no sudo. The cookie goes
         // straight down the XPC channel into openconnect's stdin.
+        //
+        // THERE IS EXACTLY ONE FAILURE RETURN BELOW THAT SKIPS THE SUDO PATH, and it is
+        // taken on `.refused`. The reason is what the sudo path actually is: the helper's
+        // `tunnel` subcommand `exec`s openconnect with no liveness check and no lock, so
+        // falling through after a refusal spawns a tunnel into whatever made the daemon
+        // say no — in practice the mutation gate held by a launch or wake reconcile, i.e.
+        // openconnect installing routes while a sweep deletes them. A refusal is an
+        // answer, and the honest response is to fail the connect with the daemon's own
+        // message. `.unreachable` still falls through, exactly as before: a daemon that
+        // said nothing is not a daemon that said no.
         if transport == .daemon {
             let expandedForDaemon = expandExceptionRoutes(profile.lanAccess.manualExceptionRoutes)
             for note in expandedForDaemon.notes { appendLog("[anyway]   exception route: \(note)") }
-            let result = PrivilegedClient.shared.startTunnel(
+            let outcome = PrivilegedClient.shared.startTunnel(
                 protocolName: proto, host: host, fingerprint: fingerprint, resolve: resolve,
                 autoAddLocalSubnet: profile.lanAccess.autoAddLocalSubnet,
                 exceptionRoutes: expandedForDaemon.routes,
                 logPath: logFile.path, cookie: cookie)
-            appendLog("[anyway] privileged daemon: \(result.message)")
-            if result.ok { return nil }
-            // Fall through to the sudo paths rather than failing outright.
-            appendLog("[anyway] daemon start failed — falling back to sudo")
-            invalidateTransportCache()
+            appendLog("[anyway] privileged daemon: \(outcome.message)")
+            switch outcome {
+            case .ok:
+                return nil
+            case .refused(let message):
+                return message
+            case .unreachable:
+                appendLog("[anyway] daemon unreachable — falling back to sudo")
+                invalidateTransportCache()
+            }
         }
 
         // Only the shell paths need the cookie on stdin, and stdin is /dev/null for a
@@ -882,8 +945,35 @@ final class VPNRunner {
 
     // MARK: - Default-route safety (snapshot/restore)
 
-    // Capture the current physical default gateway + interface as "gw|iface".
-    func snapshotDefaultRoute() -> String {
+    /// What was true about the physical default route before the tunnel touched it.
+    ///
+    /// This replaces a `"gw|iface"` string, and the replacement is the fix rather than
+    /// tidying: one string carrying two meanings is how a gateway address captured on
+    /// the office LAN survived long enough to be replayed at home, where it blackholed
+    /// the machine. Here the address is explicitly an *advisory* — named so it cannot be
+    /// mistaken for something installable — and the interface, which is the only thing
+    /// still worth transmitting, stands on its own.
+    struct DefaultRouteSnapshot: Equatable {
+        /// "" ⇒ nothing trustworthy was captured, and restore does nothing.
+        let interface: String
+        /// The interface's subnet at snapshot time, e.g. "10.0.1.0/24". This is what
+        /// makes "same network as when we snapshotted" a question that can be asked.
+        let subnet: String
+        /// DIAGNOSTIC ONLY. Never transmitted to the daemon and never installed —
+        /// logged so a divergence between what the app expected and what the daemon
+        /// derived is visible in one line.
+        let gatewayAdvisory: String
+
+        var isEmpty: Bool { interface.isEmpty }
+        static let none = DefaultRouteSnapshot(interface: "", subnet: "", gatewayAdvisory: "")
+    }
+
+    /// Identify the physical default route's interface, and record the subnet it was on.
+    ///
+    /// Still `route -n get default` for the interface — that is the kernel's own answer
+    /// to "where does ordinary traffic go" — but the subnet comes from the interface
+    /// snapshot, which is the only place a prefix length exists.
+    func snapshotDefaultRoute() -> DefaultRouteSnapshot {
         let out = shellCapture("/sbin/route", ["-n", "get", "default"])
         var gw = "", ifc = ""
         for line in out.split(separator: "\n") {
@@ -891,40 +981,171 @@ final class VPNRunner {
             if t.hasPrefix("gateway:") { gw = t.replacingOccurrences(of: "gateway:", with: "").trimmingCharacters(in: .whitespaces) }
             if t.hasPrefix("interface:") { ifc = t.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespaces) }
         }
-        // Only trust a physical interface (en*/bridge*), not a tunnel (utun*).
-        if ifc.hasPrefix("utun") { return "" }
-        return gw.isEmpty ? "" : "\(gw)|\(ifc)"
+        // Refusing a tunnel target is the same rule the daemon applies, by the same
+        // predicate, so the two cannot drift: restoring the "physical" default onto a
+        // utun is the failure this change exists to stop.
+        guard !ifc.isEmpty, PrivilegedValidation.isRestoreTargetInterface(ifc) else {
+            return .none
+        }
+        let subnet = NetProbe.interfaces().first { $0.name == ifc }?.subnetCIDR ?? ""
+        return DefaultRouteSnapshot(interface: ifc, subnet: subnet, gatewayAdvisory: gw)
     }
 
-    // Restore the physical default route if it was clobbered by a failed tunnel.
-    func restoreDefaultRoute(_ snapshot: String) {
+    /// Restore the physical default route if it was clobbered by a failed tunnel.
+    ///
+    /// The snapshot no longer says *what* to install, only *where*. Each transport
+    /// derives the next hop from the live system and refuses rather than guess.
+    func restoreDefaultRoute(_ snapshot: DefaultRouteSnapshot) {
         guard !snapshot.isEmpty else { return }
-        let parts = snapshot.split(separator: "|").map(String.init)
-        guard let gw = parts.first, !gw.isEmpty else { return }
-        let iface = parts.count > 1 ? parts[1] : ""
+        let iface = snapshot.interface
 
-        // Only act if the current default is missing or points at a tunnel.
+        // Cheap app-side pre-check, kept to avoid a pointless privileged round trip.
+        // Not a safety boundary: the daemon re-checks the same precondition itself,
+        // because it trusts no fact a caller claims to have established.
         let current = shellCapture("/sbin/route", ["-n", "get", "default"])
         let onTunnel = current.range(of: "interface: utun", options: .regularExpression) != nil
         let noDefault = current.range(of: "gateway:") == nil
         guard onTunnel || noDefault else { return }  // physical default already fine
 
-        if privilegedTransport() == .daemon {
-            let result = PrivilegedClient.shared.restoreDefaultRoute(gateway: gw, interface: iface)
-            if result.ok {
-                NSLog("AnywayConnect: \(result.message)")
-                return
+        // Say out loud what the app thought the gateway was and what the guard makes of
+        // it. The advisory is never installed, so this line is the only place a
+        // divergence between app expectation and privileged derivation becomes visible.
+        let advisory = snapshot.gatewayAdvisory
+        if !advisory.isEmpty {
+            switch evaluateDefaultGateway(candidate: advisory, targetInterface: iface,
+                                          interfaces: NetProbe.interfaces()) {
+            case .accept:
+                appendLog("[anyway] restore target \(iface): advisory \(advisory) -> accept; "
+                        + "deriving privileged-side anyway")
+            case .reject(let why):
+                appendLog("[anyway] restore target \(iface): advisory \(advisory) -> "
+                        + "reject(\(why.rawValue)); deriving privileged-side")
             }
-            invalidateTransportCache()
         }
+
+        if privilegedTransport() == .daemon {
+            switch PrivilegedClient.shared.restoreDefaultRoute(interface: iface) {
+            case .ok(let message):
+                appendLog("[anyway] privileged daemon restore: \(message)")
+                return
+            case .refused(let message):
+                // The guard said no, and a refusal is an ANSWER. Retrying it on the
+                // sudo helper — which runs a weaker, shell-side copy of the same guard —
+                // would be bypassing the check that just spoke. Logged verbatim because
+                // the message carries the derivation transcript.
+                appendLog("[anyway] privileged daemon refused the restore: \(message)")
+                return
+            case .unreachable(let message):
+                appendLog("[anyway] privileged daemon unreachable (\(message)) — "
+                        + "falling back to sudo")
+                invalidateTransportCache()
+            }
+        }
+
         if helperIsUsable() {
-            var args = ["-n", rootHelper, "restore-default", gw]
-            if !iface.isEmpty { args.append(iface) }
-            _ = shellCapture("/usr/bin/sudo", args)
-        } else {
-            _ = shellCapture("/usr/bin/sudo", ["/sbin/route", "-n", "change", "default", gw])
+            // No gateway argument: the helper derives and guards it the same way.
+            // Judged by the FINAL-LINE SENTINEL, not by an exit status —
+            // shellCaptureSplit discards terminationStatus, so there is no status to
+            // read, and inferring success from empty stderr would be worse than
+            // reading the verdict the helper prints on purpose.
+            //
+            // The sentinel is sought in STDOUT's last line, not in `out + err`: the
+            // helper's guard writes its rejection reasons to stderr, and a *successful*
+            // derivation that rejected its first candidate before accepting the second
+            // emits exactly that — so concatenating the streams would leave a guard line
+            // last and report a completed restore as unconfirmed. Both streams are still
+            // logged; only the verdict is read from the stream that carries it.
+            let r = shellCaptureSplit("/usr/bin/sudo", ["-n", rootHelper, "restore-default", iface],
+                                      timeout: 30)
+            let text = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
+            let verdict = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if r.timedOut {
+                appendLog("[anyway] helper restore-default \(iface): timed out after 30s")
+            } else if verdict.hasSuffix("restore-default: ok") {
+                appendLog("[anyway] helper restore-default \(iface): ok\n\(text)")
+            } else {
+                // The helper's stderr carries the guard's reasons. Not retried further:
+                // the only weaker transport left prompts for a password.
+                appendLog("[anyway] helper restore-default \(iface) did not confirm:\n\(text)")
+            }
+            return
         }
-        NSLog("AnywayConnect: restored default route via \(gw) \(iface)")
+
+        // Last resort, and the one place the guard is enforced app-side only (O-3):
+        // there is no privileged backend to derive in, so the app derives, and acts
+        // only on an acceptance.
+        let derivation = deriveDefaultGateway(interface: iface,
+                                              interfaces: NetProbe.interfaces(),
+                                              dhcpRouter: NetProbe.dhcpRouter(for: iface),
+                                              routeTable: NetProbe.routeTable(),
+                                              netstate: NetState.load())
+        guard let accepted = derivation.accepted else {
+            appendLog("[anyway] refusing to restore default via \(iface): "
+                    + derivation.transcript.joined(separator: "; "))
+            return
+        }
+        _ = shellCapture("/usr/bin/sudo",
+                         ["/sbin/route", "-n", "change", "default", accepted.gateway])
+        appendLog("[anyway] restored default via \(accepted.gateway) (\(iface)) "
+                + "from \(accepted.source.rawValue) [interactive sudo]")
+    }
+
+    // MARK: - Reconcile
+
+    /// Ask the privileged side to sweep leftover VPN routing/DNS state and put a usable
+    /// physical default back.
+    ///
+    /// Nothing is decided here: the daemon re-gates on tunnel liveness, derives every
+    /// address itself and guards every install. This function only chooses a transport
+    /// and reports what came back.
+    @discardableResult
+    func reconcileNow(reason: String) -> PrivilegedOutcome {
+        switch privilegedTransport() {
+        case .daemon:
+            let outcome = PrivilegedClient.shared.reconcile()
+            appendLog("[anyway] reconcile (\(reason)): \(outcome.message)")
+            // Only a transport failure is grounds for trying something else. A refusal
+            // is an answer — the same split as the restore, and for the same reason.
+            if case .unreachable = outcome {
+                invalidateTransportCache()
+                return reconcileViaHelper(reason: reason)
+            }
+            return outcome
+
+        case .sudoHelper:
+            return reconcileViaHelper(reason: reason)
+
+        case .interactiveSudo:
+            // This runs unattended — app launch, wake, a Wi-Fi hop — and a password
+            // prompt there is useless as well as hostile. NOTHING IS MUTATED on this
+            // arm: it logs and returns.
+            let message = "reconcile unavailable: no non-interactive privileged backend"
+            appendLog("[anyway] \(message)")
+            return .refused(message)
+        }
+    }
+
+    private func reconcileViaHelper(reason: String) -> PrivilegedOutcome {
+        guard helperIsUsable() else {
+            return .refused("reconcile unavailable: no non-interactive privileged backend")
+        }
+        // shellCaptureSplit, not shellCapture: the latter has no timeout, and this call
+        // becomes a blocking step in the wake sequence — an unbounded wait there would
+        // stall the redial. 90s matches the XPC bound and the daemon's phase arithmetic.
+        let r = shellCaptureSplit("/usr/bin/sudo", ["-n", rootHelper, "reconcile"], timeout: 90)
+        let message = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.timedOut {
+            appendLog("[anyway] reconcile (\(reason)) via helper: timed out after 90s")
+            return .refused("reconcile timed out after 90s")
+        }
+        appendLog("[anyway] reconcile (\(reason)) via helper: \(message)")
+        // The helper's LAST STDOUT LINE is its verdict. shellCaptureSplit discards the
+        // child's exit status, so there is no status to read here, and inferring success
+        // from an empty stderr would be worse than reading the sentinel the helper
+        // prints on purpose — the sweep notice and the guard's reasons both go to stderr
+        // on runs that succeed, so the streams must not be concatenated before this test.
+        let verdict = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return verdict.hasSuffix("reconcile: ok") ? .ok(message) : .refused(message)
     }
 
     private func parseAuthOutput(_ out: String) -> [String: String] {

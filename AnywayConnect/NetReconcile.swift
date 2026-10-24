@@ -210,6 +210,663 @@ public enum NetReconcile {
     }
 }
 
+// MARK: - The reconcile plan
+//
+// What a reconcile would do, as a value. The daemon's apply phase is a `switch`
+// with no decision of its own, which is the whole point: the risky reasoning —
+// "is this route dead", "may this default be deleted", "what do we install
+// instead" — is decided here, by a function that cannot touch the system, and is
+// asserted against checked-in captures of real route tables.
+
+public enum ReconcileAction: Equatable {
+    case removeConfigdKey(String)                                        // FR-2.5
+    case deleteTunnelDefaultRoute(netif: String, ifscoped: Bool)         // FR-2.4
+    case deleteStalePhysicalDefaultRoute(netif: String, ifscoped: Bool,
+                                         reason: GatewayRejection)       // §4.3(b)
+    case deleteRoute(RouteDeletion)                                      // FR-2.6 / FR-2.7
+    case installDefaultRoute(interface: String)                          // FR-2.8
+}
+
+public struct RouteDeletion: Equatable {
+    public let destination: String       // canonical dotted quad
+    public let netmask: String?          // nil ⇒ host route
+    public let ifscope: String?          // nil ⇒ the unscoped form
+
+    public init(destination: String, netmask: String?, ifscope: String?) {
+        self.destination = destination
+        self.netmask = netmask
+        self.ifscope = ifscope
+    }
+}
+
+/// Diagnostic only; never executed. Present because "we left this alone" is the
+/// answer that needs explaining, and because the tests assert the absence of a
+/// deletion by asserting what was kept instead.
+public enum ReconcileKept: Equatable {
+    case onLinkRoute(String)
+    case loopback(String)
+    case multicast(String)
+    case linkLocal(String)
+    case gatewayOnLink(String, via: String)
+    /// A route whose next hop is still held by a LIVE tunnel interface. Not
+    /// deleted, because FR-2.6c forbids deleting a route whose gateway is on-link
+    /// for some live interface — a vanished tunnel's address is swept, which is
+    /// the common case after a dead tunnel (open issue O-1).
+    case tunnelOnLinkGateway(String, via: String)
+    case unparsable(String)
+    /// A default route on a non-tunnel interface that is UNSCOPED and whose next
+    /// hop the guard accepts. The thing being protected, and the only thing that
+    /// counts as "a usable physical default already exists" in (f).
+    case physicalDefaultUsable(netif: String)
+    /// A default route on a non-tunnel interface we neither delete nor count as
+    /// usable: scoped-only though otherwise fine, a down link, or an `-interface`
+    /// default with no IPv4 next hop. `why` is a short fixed string, so a test can
+    /// assert it.
+    case physicalDefaultUnusable(netif: String, why: String)
+    /// A tunnel the netstate says was somebody else's.
+    case foreignTunnel(String)
+    /// No netstate, so (a)/(b) fell back to acting on EVERY utun. Recorded and
+    /// logged because of what it can dismantle — see open issue O-9.
+    case widenedToAllTunnels([String])
+    case ambiguousInstallTarget([String])
+    /// (g): PHYSICAL default-route deletions this plan dropped because it could
+    /// not also install one. The record of the one asymmetry that is never allowed
+    /// to resolve the other way.
+    case defaultDeletionsWithheld(netifs: [String])
+}
+
+public enum ReconcileAbort: Equatable {
+    case sweepCapExceeded(found: Int, cap: Int)
+    case routeTableUnreadable
+    /// The interface snapshot cannot prove anything on-link — see (d″). Distinct
+    /// from `routeTableUnreadable` because the suppressed clauses are the same but
+    /// the input that failed is not, and the transcript has to name which.
+    case interfaceSnapshotUnusable
+}
+
+public struct ReconcilePlan: Equatable {
+    public var actions: [ReconcileAction]      // ordered; apply executes in this order
+    public var kept: [ReconcileKept]
+    public var abort: ReconcileAbort?
+    /// The plan-time gateway candidates for the install target, as text, so apply
+    /// can log a plan-time/apply-time divergence. Diagnostic only; nil when no
+    /// install was emitted.
+    public var installCandidateNote: String?
+
+    public init(actions: [ReconcileAction] = [], kept: [ReconcileKept] = [],
+                abort: ReconcileAbort? = nil, installCandidateNote: String? = nil) {
+        self.actions = actions
+        self.kept = kept
+        self.abort = abort
+        self.installCandidateNote = installCandidateNote
+    }
+
+    public var isEmpty: Bool { actions.isEmpty }
+}
+
+public enum ReconcileCommand: Equatable {
+    /// One scutil invocation for every configd key, stdin = "open\nremove K\n…\nclose\n".
+    case scutil(stdin: String, keys: [String])
+    /// A single deterministic /sbin/route invocation, argv complete.
+    case route(argv: [String])
+    /// The ONLY state-dependent command: delete the unscoped default repeatedly,
+    /// but each time only while `route -n get default` still names this interface.
+    /// Expressed as a command rather than as argv because its stop condition is
+    /// the live table.
+    case deleteUnscopedDefaultWhileInterface(netif: String, maxIterations: Int)
+    /// Re-probe, derive, guard, install. Daemon-only execution.
+    case deriveAndInstallDefault(interface: String)
+}
+
+/// Partitioned, not a flat list. `prologue` and `install` are ESSENTIAL and run
+/// regardless of elapsed time; `sweep` is best-effort under a deadline. The
+/// install is the one command whose omission turns this operation into the very
+/// outcome it exists to prevent, so it can never be the thing a budget drops.
+public struct ReconcileCommands: Equatable {
+    public let prologue: [ReconcileCommand]   // configd + every default-route deletion
+    public let sweep: [ReconcileCommand]      // the per-destination deletions
+    public let install: [ReconcileCommand]    // .deriveAndInstallDefault, or empty
+
+    public init(prologue: [ReconcileCommand], sweep: [ReconcileCommand],
+                install: [ReconcileCommand]) {
+        self.prologue = prologue
+        self.sweep = sweep
+        self.install = install
+    }
+
+    public var essential: [ReconcileCommand] { prologue + install }
+
+    /// APPLY ORDER: prologue, then install, then sweep.
+    ///
+    /// The install is deliberately NOT last. Sweeping first leaves the machine with no
+    /// default route for the whole sweep window — a few seconds on a carried-home table
+    /// of ~117 destinations — which is the very outage this operation exists to end.
+    /// Nothing in the sweep depends on the default being absent: every deletion names
+    /// its own destination.
+    public var all: [ReconcileCommand] { prologue + install + sweep }
+    public var isEmpty: Bool { all.isEmpty }
+}
+
+public enum ReconcileGate: Equatable {
+    case proceed
+    case noop(alivePID: Int32)
+}
+
+extension NetReconcile {
+
+    /// FR-2.7. Bounds DISTINCT swept destinations — not emitted actions and not
+    /// netstat rows. Each distinct destination emits one unscoped deletion plus one
+    /// deletion per interface it was scoped to, so the worst case for 256 is a few
+    /// hundred `route` invocations, additionally bounded by the sweep phase's
+    /// budget. 256 covers the observed 117 with headroom.
+    public static let sweepCap = 256
+
+    /// FR-2.2's judgement, and the single safety-critical gate in the whole
+    /// operation: a reconcile must never run while a tunnel of ours is alive. Pure,
+    /// so it is testable with literals — no live tunnel, no installed daemon.
+    ///
+    /// A frozen-but-alive openconnect counts as alive, which is correct:
+    /// dismantling the routing of a tunnel that may still recover is the one thing
+    /// this operation must never do.
+    public static func gate(pids: [Int32], isAlive: (Int32) -> Bool) -> ReconcileGate {
+        if let pid = pids.first(where: isAlive) { return .noop(alivePID: pid) }
+        return .proceed
+    }
+
+    /// The non-tunnel IPv4 default route's interface and gateway, preferring the
+    /// unscoped row and falling back to a scoped one, with the subnet filled in
+    /// from the interface snapshot. `nil` when there is no such default — which is
+    /// what makes `startTunnel` skip writing a netstate rather than write a partial
+    /// one.
+    public static func physicalDefault(routeTable: String, interfaces: [NetInterface])
+        -> (interface: String, gateway: String, subnet: String)? {
+        let rows = parseRouteTable(routeTable).filter {
+            $0.destination == .defaultRoute && $0.gateway != nil
+                && !isTunnelLikeName($0.netif, interfaces)
+        }
+        guard let row = rows.first(where: { !$0.isIfScoped }) ?? rows.first,
+              let gateway = row.gateway,
+              let subnet = interfaces.first(where: { $0.name == row.netif })?.subnetCIDR
+        else { return nil }
+        return (interface: row.netif, gateway: gateway.text, subnet: subnet)
+    }
+
+    /// `netif` names a tunnel, whether or not the snapshot still has the link.
+    ///
+    /// Both halves are needed: a row for a utun that has already vanished still
+    /// has to be classified as a tunnel default (FR-2.4), and a point-to-point
+    /// link with an unexpected name is still a tunnel.
+    private static func isTunnelLikeName(_ netif: String,
+                                         _ interfaces: [NetInterface]) -> Bool {
+        if let iface = interfaces.first(where: { $0.name == netif }) {
+            return iface.isTunnelLike
+        }
+        for p in ["utun", "ppp", "ipsec", "gif", "stf"] where netif.hasPrefix(p) {
+            return true
+        }
+        return false
+    }
+
+    /// Canonical text of a destination, for the kept-record diagnostics and for the
+    /// deletion argv. Never netstat's abbreviation: `route`'s own parser runs the
+    /// pre-slash text through `inet_aton`, which reads `3.7.35` as `3.7.0.35`.
+    private static func displayDestination(_ d: RouteEntry.Destination) -> String {
+        switch d {
+        case .defaultRoute: return "default"
+        case .host(let a): return a.text
+        case .network(let a, let p): return "\(a.text)/\(p)"
+        case .unparsable(let raw): return raw
+        }
+    }
+
+    /// PURE. No `Process`, no file I/O, no global reads: everything arrives as a
+    /// parameter, which is what makes the plan assertable against checked-in
+    /// fixtures.
+    ///
+    /// Clause letters are the design's and are kept for every cross-reference:
+    /// (a) configd keys, (d′)/(d″) the two fail-closed aborts, (b) default routes,
+    /// (c) the sweep, (d) the cap, (f) the install, (e) the empty-plan complement,
+    /// (g) the final withholding pass.
+    public static func plan(routeTable: String,
+                            interfaces: [NetInterface],
+                            configdKeys: [String],
+                            netstate: NetState?) -> ReconcilePlan {
+        var actions: [ReconcileAction] = []
+        var kept: [ReconcileKept] = []
+        var abort: ReconcileAbort?
+
+        let rows = parseRouteTable(routeTable)
+
+        // ── (a) configd keys (FR-2.5), scoped to tunnels that are not somebody
+        // else's. Anchored at both ends with the service component constrained to
+        // `utun` + digits, so a UUID-named physical service — which on a real
+        // machine is the REAL resolver configuration — can never match.
+        var keyByTunnel: [String: [String: String]] = [:]   // utun -> ("IPv4"/"DNS") -> key
+        for key in configdKeys {
+            guard let m = matchConfigdKey(key) else { continue }
+            keyByTunnel[m.tunnel, default: [:]][m.kind] = key
+        }
+
+        // The tunnel scope, shared by (a) and (b).
+        var tunnelNamesSeen = Set(interfaces.filter(\.isTunnelLike).map(\.name))
+        for row in rows where row.netif.range(of: "^utun[0-9]{1,3}$",
+                                              options: .regularExpression) != nil {
+            tunnelNamesSeen.insert(row.netif)
+        }
+        tunnelNamesSeen.formUnion(keyByTunnel.keys)
+
+        let inScope: Set<String>
+        if let ns = netstate {
+            // Presence decides, not non-emptiness: a netstate with an empty
+            // exclusion list is a positive statement that no tunnel was ours to
+            // spare, which is different from having no netstate at all.
+            let foreign = Set(ns.preexistingTunnels)
+            inScope = tunnelNamesSeen.subtracting(foreign)
+            kept += foreign.intersection(tunnelNamesSeen).sorted().map { .foreignTunnel($0) }
+        } else {
+            // FR-2.4/FR-2.5 as written: every utun. Recorded and logged because of
+            // what it can dismantle on a machine also running a third-party VPN
+            // (open issue O-9).
+            inScope = tunnelNamesSeen
+            if !inScope.isEmpty { kept.append(.widenedToAllTunnels(inScope.sorted())) }
+        }
+
+        // Stable order: IPv4 before DNS per utun, ascending by name — the same order
+        // the installed vpnc-script uses in its own removal heredoc.
+        for tunnel in keyByTunnel.keys.sorted() where inScope.contains(tunnel) {
+            for kind in ["IPv4", "DNS"] {
+                if let key = keyByTunnel[tunnel]?[kind] {
+                    actions.append(.removeConfigdKey(key))
+                }
+            }
+        }
+
+        // ── (d′) an unreadable route table, and (d″) an unusable interface
+        // snapshot. Both evaluated BEFORE (b), both suppressing (b), (c) and (f),
+        // both RETAINING (a) — the configd removals derive solely from the scutil
+        // key list and need no route table at all, and on a wedged machine clearing
+        // the DNS override is the single most valuable thing we can do.
+        //
+        // An input we cannot read is a reason NOT to act, never evidence that
+        // routes are dead. Without (d″) the planner reads "the snapshot cannot
+        // prove this gateway is on-link" as "this gateway is dead", sweeps the whole
+        // table, deletes the physical default, and then refuses to install one for
+        // the same reason it deleted — NFR-8 inverted into the failure it forbids.
+        if rows.isEmpty {
+            abort = .routeTableUnreadable
+        } else if !interfaces.contains(where: isUsablePhysical) {
+            abort = .interfaceSnapshotUnusable
+        }
+
+        guard abort == nil else {
+            return ReconcilePlan(actions: actions, kept: kept, abort: abort)
+        }
+
+        // ── (b) default routes (FR-2.4, and the stale physical default). Classified
+        // per ROW, not per interface: the scoped and unscoped forms are separate
+        // rows needing different deletion argv.
+        var staleDefaultNetifs: [String] = []
+        var keptPhysicalDefaultNetifs: [String] = []
+        var hasUsablePhysicalDefault = false
+
+        for row in rows where row.destination == .defaultRoute {
+            if isTunnelLikeName(row.netif, interfaces) {
+                if inScope.contains(row.netif) {
+                    actions.append(.deleteTunnelDefaultRoute(netif: row.netif,
+                                                             ifscoped: row.isIfScoped))
+                } else {
+                    kept.append(.foreignTunnel(row.netif))
+                }
+                continue
+            }
+            switch evaluateDefaultGateway(candidate: row.gatewayText,
+                                          targetInterface: row.netif,
+                                          interfaces: interfaces) {
+            case .accept:
+                if row.isIfScoped {
+                    // Correct for that link, so never deleted — but it does not
+                    // serve unbound traffic, so (f) must still install the unscoped
+                    // form. This is the live machine's actual shape.
+                    kept.append(.physicalDefaultUnusable(netif: row.netif,
+                                                         why: "ifscope-only"))
+                    keptPhysicalDefaultNetifs.append(row.netif)
+                } else {
+                    kept.append(.physicalDefaultUsable(netif: row.netif))
+                    hasUsablePhysicalDefault = true
+                }
+
+            case .reject(let reason):
+                switch reason {
+                case .targetInterfaceDown:
+                    // The link may come back with the same subnet and revalidate the
+                    // route; deleting a dormant-but-plausible default buys nothing,
+                    // and the install would refuse for the same reason.
+                    kept.append(.physicalDefaultUnusable(netif: row.netif,
+                                                         why: "link down"))
+                    keptPhysicalDefaultNetifs.append(row.netif)
+
+                case .targetInterfaceMissing, .targetInterfaceUnconfigured:
+                    // The SAME reason as `targetInterfaceDown`: both verdicts
+                    // describe the snapshot, not the next hop. An up-but-un-addressed
+                    // link is a link mid-DHCP — the normal state in the window the
+                    // path monitor fires in — and a missing link is a failed or raced
+                    // getifaddrs. Neither is evidence that the route is dead.
+                    kept.append(.physicalDefaultUnusable(netif: row.netif,
+                                                         why: "target not addressed"))
+                    keptPhysicalDefaultNetifs.append(row.netif)
+
+                case .malformedGateway, .malformedInterfaceName:
+                    // An `-interface` default (gateway `link#N`) is legitimate and we
+                    // cannot reason about it; keeping is the safe direction.
+                    kept.append(.physicalDefaultUnusable(netif: row.netif,
+                                                         why: "no IPv4 next hop"))
+                    keptPhysicalDefaultNetifs.append(row.netif)
+
+                case .targetInterfaceIsTunnel:
+                    // Unreachable: the tunnel branch above ran first. Kept rather
+                    // than deleted anyway, because an unreachable branch that
+                    // deletes routes is not a branch worth leaving behind.
+                    kept.append(.physicalDefaultUnusable(netif: row.netif,
+                                                         why: "tunnel target"))
+
+                case .gatewayOffLink, .gatewayIsTunnelAddress, .gatewayIsOwnAddress,
+                     .unspecifiedGateway, .gatewayIsNetworkAddress,
+                     .gatewayIsBroadcastAddress:
+                    // THE CARRIED-HOME BLACKHOLE. Every reason here is derived from a
+                    // link that IS present, up and addressed, so the next hop
+                    // provably cannot carry traffic on that link: deleting it costs
+                    // nothing that works, and is a precondition for installing one
+                    // that does.
+                    actions.append(.deleteStalePhysicalDefaultRoute(
+                        netif: row.netif, ifscoped: row.isIfScoped, reason: reason))
+                    staleDefaultNetifs.append(row.netif)
+                }
+            }
+        }
+
+        // ── (c) the sweep (FR-2.6, FR-2.7). First match decides.
+        var sweptOrder: [RouteDeletion] = []            // the unscoped key, in first-seen order
+        var sweptNetifs: [String: [String]] = [:]       // "dst|mask" -> distinct netifs
+        func sweepKey(_ d: RouteDeletion) -> String { "\(d.destination)|\(d.netmask ?? "")" }
+
+        for row in rows where row.destination != .defaultRoute {
+            let dst = displayDestination(row.destination)
+
+            if case .unparsable = row.destination {
+                // A destination we cannot name exactly cannot be named exactly to
+                // `route delete` either (§4.2 rule 5).
+                kept.append(.unparsable(dst))
+                continue
+            }
+            guard let gw = row.gateway else {
+                // link#N, a MAC, an `-interface` route: this IS the LAN on-link
+                // route (FR-2.6a). Matched before the destination categories, so on
+                // a real table the multicast/link-local rows classify here — which
+                // is harmless, since every one of them is kept either way.
+                kept.append(.onLinkRoute(dst))
+                continue
+            }
+            if row.netif == "lo0" || destinationAddress(row.destination)?.isLoopback == true {
+                kept.append(.loopback(dst))
+                continue
+            }
+            if let addr = destinationAddress(row.destination) {
+                // 255.255.255.255 is classified with the multicast group rather than
+                // given a category of its own: it is kept, and the tests assert the
+                // absence of a deletion.
+                if addr.isMulticast || addr.isBroadcastAll {
+                    kept.append(.multicast(dst)); continue
+                }
+                if addr.isLinkLocal { kept.append(.linkLocal(dst)); continue }
+            }
+
+            // The on-link question is answered by THE GUARD, classified on its
+            // rejection reason — the guard never accepts against a tunnel target, so
+            // acceptance alone cannot express the lingering-utun case. Reusing it
+            // means the sweep and the restore cannot drift: a gateway the guard would
+            // refuse to install is exactly a gateway the sweep considers dead.
+            var verdictKept = false
+            for iface in interfaces where isUsablePhysical(iface) {
+                switch evaluateDefaultGateway(candidate: gw.text,
+                                              targetInterface: iface.name,
+                                              interfaces: interfaces) {
+                case .accept:
+                    kept.append(.gatewayOnLink(dst, via: gw.text))
+                    verdictKept = true
+                case .reject(.gatewayIsTunnelAddress):
+                    // Fires only while a tunnel in the snapshot still HOLDS that
+                    // address, so a vanished utun's address falls through to swept —
+                    // the intended behaviour and the common case after a dead tunnel.
+                    kept.append(.tunnelOnLinkGateway(dst, via: gw.text))
+                    verdictKept = true
+                default:
+                    continue
+                }
+                break
+            }
+            if verdictKept { continue }
+
+            // Swept. Reduced to DISTINCT (destination, netmask) pairs before any
+            // action is created: emitting per row would produce two byte-identical
+            // deletions for every destination that appears in both scoped and
+            // unscoped form.
+            let deletion = RouteDeletion(destination: destinationAddress(row.destination)?.text
+                                                      ?? dst,
+                                         netmask: destinationNetmask(row.destination),
+                                         ifscope: nil)
+            let key = sweepKey(deletion)
+            if sweptNetifs[key] == nil {
+                sweptNetifs[key] = []
+                sweptOrder.append(deletion)
+            }
+            if !(sweptNetifs[key] ?? []).contains(row.netif) {
+                sweptNetifs[key]?.append(row.netif)
+            }
+        }
+
+        // ── (d) the cap (FR-2.7). Aborting the SWEEP rather than the whole
+        // reconcile is deliberate: clearing the DNS hijack, removing a dead default
+        // and installing a working one are the bounded actions that turn "no
+        // internet" into "internet", and refusing them because the route table is
+        // pathological would be the wrong failure.
+        if sweptOrder.count > sweepCap {
+            abort = .sweepCapExceeded(found: sweptOrder.count, cap: sweepCap)
+        } else {
+            for deletion in sweptOrder {
+                actions.append(.deleteRoute(deletion))
+                for netif in sweptNetifs[sweepKey(deletion)] ?? [] {
+                    // `route delete -net X` removes only the unscoped entry; the
+                    // interface-scoped duplicate survives it and still wins.
+                    actions.append(.deleteRoute(RouteDeletion(destination: deletion.destination,
+                                                             netmask: deletion.netmask,
+                                                             ifscope: netif)))
+                }
+            }
+        }
+
+        // ── (f) install a usable physical default (FR-2.8). Emitted whenever no
+        // unscoped, guard-accepted physical default is left once (b) has had its
+        // say. The gate depends on NOTHING ELSE — not on whether (a), (b) or (c)
+        // emitted anything, and not on what the sweep found.
+        //
+        // There is deliberately no "the plan is otherwise non-empty" conjunct: with
+        // one, a machine whose only fault is a MISSING default route produced an
+        // empty plan and no install — exactly the state the vendored script's own
+        // teardown leaves behind.
+        var installCandidateNote: String?
+        if !hasUsablePhysicalDefault {
+            let candidates = interfaces.filter(isUsablePhysical).map(\.name)
+            var target: String?
+            if let ns = netstate, candidates.contains(ns.physicalInterface) {
+                target = ns.physicalInterface
+            } else if let netif = staleDefaultNetifs.first {
+                // The link whose default we just removed is the obvious replacement.
+                target = netif
+            } else if let netif = keptPhysicalDefaultNetifs.first {
+                target = netif
+            } else if candidates.count == 1 {
+                target = candidates[0]
+            } else if candidates.count > 1 {
+                kept.append(.ambiguousInstallTarget(candidates.sorted()))
+            }
+            if let target {
+                actions.append(.installDefaultRoute(interface: target))
+                installCandidateNote = self.installCandidateNote(interface: target,
+                                                                 rows: rows,
+                                                                 interfaces: interfaces,
+                                                                 netstate: netstate)
+            }
+        }
+
+        // ── (g) the asymmetry, and it is load-bearing: never delete a default that
+        // could carry traffic without installing one. (e) and (f) partition the
+        // state space on "a usable physical default exists", but (f)'s target
+        // selection can still fail after (b) has decided to delete something.
+        //
+        // Only the PHYSICAL deletion is withheld. FR-2.4 is unconditional and the
+        // gate has already proved no tunnel of ours is alive, so a default via that
+        // utun provably cannot carry traffic: withholding it would leave THAT route
+        // as the machine's default — guaranteed no internet, and not repairable
+        // until the next reconcile. Deleting it leaves no default, which is
+        // recoverable.
+        if actions.contains(where: { if case .deleteStalePhysicalDefaultRoute = $0 { return true }
+                                     else { return false } }),
+           !actions.contains(where: { if case .installDefaultRoute = $0 { return true }
+                                      else { return false } }),
+           !hasUsablePhysicalDefault {
+            actions.removeAll { if case .deleteStalePhysicalDefaultRoute = $0 { return true }
+                                else { return false } }
+            kept.append(.defaultDeletionsWithheld(netifs: staleDefaultNetifs))
+        }
+
+        return ReconcilePlan(actions: actions, kept: kept, abort: abort,
+                             installCandidateNote: installCandidateNote)
+    }
+
+    /// A link the guard could plausibly accept a next hop for: up, not a tunnel,
+    /// IPv4-addressed — and not the loopback.
+    ///
+    /// Loopback is excluded although §4.3's predicate does not name it, because
+    /// `lo0` is always present, up and addressed: counting it would make (d″)
+    /// unreachable on every real machine and would put `lo0` in every
+    /// `ambiguousInstallTarget` list.
+    private static func isUsablePhysical(_ iface: NetInterface) -> Bool {
+        iface.isUp && !iface.isTunnelLike && !iface.isLoopback && iface.ipv4 != nil
+    }
+
+    private static func matchConfigdKey(_ key: String) -> (tunnel: String, kind: String)? {
+        let pattern = "^State:/Network/Service/(utun[0-9]{1,3})/(IPv4|DNS)$"
+        guard let r = try? NSRegularExpression(pattern: pattern),
+              let m = r.firstMatch(in: key, range: NSRange(key.startIndex..., in: key)),
+              let tunnel = Range(m.range(at: 1), in: key),
+              let kind = Range(m.range(at: 2), in: key)
+        else { return nil }
+        return (String(key[tunnel]), String(key[kind]))
+    }
+
+    private static func destinationAddress(_ d: RouteEntry.Destination) -> IPv4? {
+        switch d {
+        case .host(let a): return a
+        case .network(let a, _): return a
+        case .defaultRoute, .unparsable: return nil
+        }
+    }
+
+    private static func destinationNetmask(_ d: RouteEntry.Destination) -> String? {
+        switch d {
+        case .network(_, let p): return IPv4.maskText(bits: p)
+        case .host, .defaultRoute, .unparsable: return nil
+        }
+    }
+
+    /// Exactly `"routeTable <gw|none>; netstateAdvisory <gw|none|subnet-mismatch>"`.
+    ///
+    /// Candidate 1 of the derivation ladder (the DHCP router) is deliberately
+    /// absent: `plan` takes no `dhcpRouter`, because that candidate is apply-time
+    /// only — the daemon re-probes it immediately before installing, which is the
+    /// whole point of FR-1.6.
+    private static func installCandidateNote(interface: String,
+                                             rows: [RouteEntry],
+                                             interfaces: [NetInterface],
+                                             netstate: NetState?) -> String {
+        let tableGateway = rows.first {
+            $0.destination == .defaultRoute && $0.netif == interface && $0.gateway != nil
+        }?.gateway?.text ?? "none"
+
+        var advisory = "none"
+        if let ns = netstate, ns.physicalInterface == interface {
+            let live = interfaces.first(where: { $0.name == interface })?.subnetCIDR
+            advisory = (live != nil && live == ns.physicalSubnet)
+                ? ns.physicalGatewayAdvisory : "subnet-mismatch"
+        }
+        return "routeTable \(tableGateway); netstateAdvisory \(advisory)"
+    }
+
+    /// Formatting the argv is a DECISION, not plumbing — §4.2's `inet_aton`
+    /// reasoning lives entirely in the argument shape — so it goes in the pure
+    /// layer and only execution stays in the daemon. That is also what makes
+    /// "apply is a switch with no branch of its own" literally true.
+    public static func commands(for plan: ReconcilePlan) -> ReconcileCommands {
+        var prologue: [ReconcileCommand] = []
+        var sweep: [ReconcileCommand] = []
+        var install: [ReconcileCommand] = []
+
+        // configd first so DNS comes back, then the default-route deletions so traffic
+        // stops entering a dead next hop. The partition is what the phases execute, and
+        // they run prologue -> install -> sweep (see ReconcileCommands.all): the install
+        // precedes the sweep so the machine is never without a default for the whole
+        // sweep window.
+        let keys: [String] = plan.actions.compactMap {
+            if case .removeConfigdKey(let k) = $0 { return k } else { return nil }
+        }
+        if !keys.isEmpty {
+            let stdin = "open\n" + keys.map { "remove \($0)\n" }.joined() + "close\n"
+            prologue.append(.scutil(stdin: stdin, keys: keys))
+        }
+
+        for action in plan.actions {
+            switch action {
+            case .removeConfigdKey:
+                continue                                   // already emitted, as one call
+
+            case .deleteTunnelDefaultRoute(let netif, let ifscoped),
+                 .deleteStalePhysicalDefaultRoute(let netif, let ifscoped, _):
+                // Split by scoping. `route -n delete default` names no interface: it
+                // deletes whatever the kernel currently answers for the unscoped
+                // default, so a blind delete aimed at a SCOPED row could remove the
+                // wrong one. A -ifscope'd row is deleted by name, which is
+                // unambiguous; an unscoped row is deleted only while the current
+                // default still IS that interface.
+                if ifscoped {
+                    prologue.append(.route(argv: ["-n", "delete", "default",
+                                                  "-ifscope", netif]))
+                } else {
+                    prologue.append(.deleteUnscopedDefaultWhileInterface(netif: netif,
+                                                                         maxIterations: 8))
+                }
+
+            case .deleteRoute(let d):
+                // EXPLICIT netmask, never netstat's shorthand: `route`'s parser runs
+                // the pre-slash text through inet_aton, so `3.7.35` would mean
+                // `3.7.0.35` — a route that was never in the table, leaving the real
+                // one in place.
+                var argv = ["-n", "delete"]
+                if let netmask = d.netmask {
+                    argv += ["-net", d.destination, "-netmask", netmask]
+                } else {
+                    argv += ["-host", d.destination]
+                }
+                if let ifscope = d.ifscope { argv += ["-ifscope", ifscope] }
+                sweep.append(.route(argv: argv))
+
+            case .installDefaultRoute(let interface):
+                install.append(.deriveAndInstallDefault(interface: interface))
+            }
+        }
+        return ReconcileCommands(prologue: prologue, sweep: sweep, install: install)
+    }
+}
+
 // MARK: - The persisted netstate
 
 /// What the daemon knew about the physical network at the moment this session's

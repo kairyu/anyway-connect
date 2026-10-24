@@ -201,7 +201,20 @@ addressed directly (trust comes from `--servercert=<fingerprint>`, so hostname
 validation isn't needed), then the hostname with `--resolve=<hostname>:<ip>`
 pointing at that same node, then a plain lookup as a last resort. Every attempt
 is recorded in `~/.config/anyway-connect/state/openconnect.log`. If none confirm,
-the tunnel is torn down and the previous default route restored.
+the tunnel is torn down and a working default route restored.
+
+Restored, not replayed. The snapshot taken before the tunnel records only *which*
+interface carried the default, never the gateway address: the privileged side
+re-derives the next hop from the live system (DHCP first, then the routing table,
+then the recorded hint — and only if the interface and its subnet still match) and
+refuses to install anything no candidate can justify. Replaying a captured address
+is what blackholed a laptop carried from one network to another, so a refusal
+leaves routing untouched and says why in the log rather than guessing.
+
+The same repair runs once at app launch, when no tunnel is alive: leftover VPN
+routes and DNS overrides from a crash or a forced sleep are cleared and a usable
+default put back. It needs a privileged backend, happens off the launch path, and
+mutates nothing if a tunnel is running.
 
 A watchdog clears the busy state if a connect never completes, so the menu cannot
 be left permanently stuck. **Stop Connecting** kills the authentication child,

@@ -28,5 +28,13 @@ state/
 # is already in the repository, so the directory is a second copy of the tree.
 .worktrees/
 
+# Diagnostic output. scripts/anyway-diag.sh now writes its own report.txt into a
+# persistent bundle under ~/Library/Logs/anyway-connect/, so redirecting its stdout
+# into the checkout is no longer necessary — but it was the only way to keep the
+# verdict before that, and the habit outlives the reason. A captured run of a wedged
+# network names interfaces, gateways, resolvers and loaded security extensions; it is
+# incident evidence, not a source of truth, and it does not belong in history.
+anyway-diag*.log
+
 # macOS
 .DS_Store

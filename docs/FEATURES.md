@@ -400,6 +400,60 @@ strictly safer and strictly less repairing than the daemon backend, and the
 trade is deliberate: the fallback transport is the one with the least evidence,
 so it is the one that should act least.
 
+## Diagnosing a wedged network — `scripts/anyway-diag.sh`
+
+When the machine comes back from sleep with no usable network, the first question
+is not *how do I fix it* but **is this AnywayConnect's fault at all**. Twice that
+question has cost a reboot, and the second time a full read-only investigation
+found the answer was no: Cisco Secure Client's socket filter extension was
+failing every socket write with errno 49 while this app's routing and DNS were
+provably clean. The script exists to answer that in half a minute instead of a
+day.
+
+```sh
+sh scripts/anyway-diag.sh            # ~20s, full
+sh scripts/anyway-diag.sh --quick    # ~10s, skips the unified-log queries
+sh scripts/anyway-diag.sh --no-pmset # skips the slow power-log read
+```
+
+It is **read-only and needs no sudo**, so it is safe to run mid-incident without
+reading it first — no `route`/`scutil`/`networksetup`/`ifconfig` writes, no
+`launchctl` load/unload, no signals to the app, the daemon or `openconnect`, and
+it never reads `config.json`. It reports, in order: whether a long sleep
+preceded a recent wake (the carry-home signature); the app's, daemon's and
+`openconnect`'s state, including whether the tunnel is parented to the daemon or
+to a `sudo` chain; every default route with its gateway, interface and
+`-ifscope` flag, judged by the *same* on-link guard the app uses, plus the count
+and list of routes whose gateway is on-link for no live interface; resolver #1
+and whether any `State:/Network/Service/utun*/{IPv4,DNS}` override is present;
+four separately-reported probes so the failing layer is visible; per-extension
+error counts for the five third-party network/endpoint extensions on this
+machine; and mDNSResponder's sent-versus-answered ratio.
+
+Then one plain verdict: *this app's fault* (and what to do), *not this app*
+(naming the extension, with a recovery cheaper than a reboot and what to capture
+first), *nothing wrong here*, or *cannot tell* — which it will say rather than
+guess. Exit status mirrors it: `0` clean, `1` this app, `2` not this app, `3`
+cannot tell.
+
+Everything it collected is written to `/tmp/anyway-diag-<timestamp>/` and the
+path is printed. The report and the captures are redacted for sharing — MAC
+addresses, configd service UUIDs, the SSID, and the names of the
+`/etc/resolver/` files and search domains are stripped, while addresses,
+subnets, gateways and route destinations are kept because they are the evidence.
+The bundle also holds `openconnect.log`, copied **before any probe runs**
+because it is truncated on every connect, and `/var/log/anyway-connect-helper.log`,
+the only log here that survives a reboot. Those two are the app's own logs and
+name your endpoints, so glance over them before attaching the bundle anywhere
+public.
+
+Two findings it reports and explicitly attributes elsewhere, because anyone
+hunting a VPN problem will otherwise suspect this app: the root-owned
+`/etc/resolver/` files that pin corporate domains to VPN-only resolvers, and the
+IP literals sitting in the Wi-Fi service's `SearchDomains`. Neither is written
+by this app, which makes no `networksetup -setdnsservers` or `-setsearchdomains`
+call at all.
+
 ## LAN bypass
 
 "My local network" keeps your own subnet reachable while connected, and

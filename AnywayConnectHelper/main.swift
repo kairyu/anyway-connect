@@ -33,9 +33,39 @@ private let openconnectCandidates = [
     "/usr/bin/openconnect",
 ]
 
+/// `[YYYY-MM-DD HH:MM:SS]`, local time — byte-for-byte the format
+/// `VPNRunner.appendLog` stamps `openconnect.log` with, so the two logs can be
+/// read side by side without converting anything.
+///
+/// `strftime` over a stack buffer rather than a `DateFormatter`: `log()` is
+/// called from the privileged paths, including once per action inside the
+/// reconcile apply loop, and a cached `DateFormatter` would still take a lock
+/// and allocate per call. This is one 20-byte array and one `String`.
+///
+/// On the (impossible) short write, returns an empty stamp rather than a
+/// partial one — a line with no timestamp is obviously unstamped, a line with
+/// half a timestamp reads as a corrupt clock.
+private func logStamp() -> String {
+    var now = time(nil)
+    var parts = tm()
+    localtime_r(&now, &parts)
+    // 19 characters plus the NUL.
+    var buf = [CChar](repeating: 0, count: 20)
+    guard strftime(&buf, 20, "%Y-%m-%d %H:%M:%S", &parts) == 19 else { return "" }
+    return String(cString: buf)
+}
+
 private func log(_ message: String) {
     // Goes to the daemon's launchd stdout/stderr, see the plist.
-    FileHandle.standardError.write(Data("[anyway-helper] \(message)\n".utf8))
+    //
+    // Timestamped because /var/log/anyway-connect-helper.log is the ONLY record
+    // in this system that survives a reboot, and for the first two "network
+    // unusable" incidents not one line of it carried a clock: every correlation
+    // had to be reconstructed by matching transcripts against openconnect.log,
+    // which is truncated on every connect and only survived by luck. The stamp
+    // goes first, matching openconnect.log, so `[anyway-helper]` is still the
+    // thing to grep for and the two files sort together by eye.
+    FileHandle.standardError.write(Data("[\(logStamp())] [anyway-helper] \(message)\n".utf8))
 }
 
 // MARK: - The two /var/run state files

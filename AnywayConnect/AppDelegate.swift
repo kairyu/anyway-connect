@@ -416,9 +416,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Icons
 
-    enum IconState { case disconnected, connecting, connected }
+    /// Four states, not three: `busy` covers a connect AND a disconnect, and a caller
+    /// that collapses them has to show one of the two a badge that names the other.
+    /// `connectingKey` is what tells them apart — see its declaration.
+    enum IconState { case disconnected, connecting, disconnecting, connected }
     func stateForIcon() -> IconState {
-        if busy { return .connecting }
+        if busy { return connectingKey != nil ? .connecting : .disconnecting }
         if case .connected = state { return .connected }
         return .disconnected
     }
@@ -528,6 +531,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .connecting:   return globeIcon(badge: .symbol("ellipsis.circle.fill"),
                                              describing: "Connecting")
         case .connected:    return globeIcon(badge: .lock, describing: "Connected")
+        // No fourth badge, deliberately. A disconnect keeps whatever appearance the
+        // connection already had, because for as long as the teardown runs THE TUNNEL
+        // IS STILL UP — `state` is still `.connected` until the poll after it lands,
+        // and traffic is still going through it. The connecting ellipsis said the
+        // opposite of the truth here: "not protected yet, wait", when the user is in
+        // fact still protected and about to stop being. Inventing a third badge would
+        // buy a distinction the menu already draws in words ("Working…") at the cost
+        // of a glyph nobody has learnt, and would have to be told apart from the
+        // ellipsis at 12pt in the corner of a 19pt globe.
+        //
+        // Derived from `state` rather than hardcoded to the lock, so the one path that
+        // can reach here with the tunnel already gone shows "disconnected" instead of
+        // claiming a lock that no longer holds.
+        case .disconnecting:
+            if case .connected = state { return globeIcon(badge: .lock, describing: "Disconnecting") }
+            return globeIcon(badge: .none, describing: "Disconnecting")
         }
     }
 
@@ -941,21 +960,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // whole switch rather than only once the connect phase starts.
         connectingKey = key
         busy = true; updateButton(); rebuildMenu()
+        // The hang this half can suffer is a teardown that never completes, so it is
+        // guarded on the disconnect bound. `startConnect(key)` below re-arms on the
+        // connect bound for the second half.
+        startBusyWatchdog(.disconnect)
         notify("Switching to \(labelFor(key))…")
         VPNRunner.shared.disconnect { [weak self] in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.busy = false; self?.startConnect(key) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self?.stopBusyWatchdog()
+                self?.busy = false
+                self?.startConnect(key)
+            }
         }
     }
 
-    /// Escape hatch for a connect that isn't finishing.
+    /// Escape hatch for a connect that isn't finishing. CONNECT ONLY.
     ///
     /// Kills the authentication child, which is what unblocks the reader waiting on
     /// its pipes. If there is nothing to kill the UI is wedged for some other
     /// reason, so clear `busy` regardless rather than leaving the user stuck.
+    ///
+    /// A disconnect has no authentication child, so `cancelInFlight()` would find
+    /// nothing to kill and the teardown would carry on privileged-side regardless —
+    /// the item that calls this is therefore not offered while disconnecting, and the
+    /// guard below enforces that rather than trusting the menu to be the only caller.
+    /// A hung disconnect is recovered by its watchdog instead.
     @objc func cancelBusy() {
-        guard busy else { return }
+        guard busy, connectingKey != nil else { return }
         let killed = VPNRunner.shared.cancelInFlight()
-        notify(killed ? "Stopping…" : "Cancelled")
+        // "Cancelled" was wrong in the `!killed` branch: nothing was cancelled there,
+        // because there was nothing in flight to cancel. All that happened is that the
+        // UI stopped claiming to be busy.
+        notify(killed ? "Stopping…" : "Nothing to stop — status cleared")
         if !killed {
             stopBusyWatchdog()
             busy = false
@@ -964,20 +1000,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Which direction a watchdog is guarding.
+    ///
+    /// Passed in rather than read off `connectingKey` when the timer fires, because
+    /// `switchTo(...)` sets `connectingKey` for the whole switch — including its
+    /// disconnect half, which is the half that can hang there.
+    private enum BusyKind {
+        case connect, disconnect
+
+        /// How long to wait before declaring the operation dead.
+        ///
+        /// A connect gets 240s because its slow step is a human: authentication hands
+        /// off to a browser for SSO and someone has to read an MFA prompt.
+        ///
+        /// A disconnect gets 60s, because nothing in that path waits for a person. Its
+        /// worst case is `teardownNow()`'s own bounds added up: up to 3s probing the
+        /// privileged transport, up to 20s for the daemon's `stopTunnel` XPC call, then
+        /// on a daemon failure up to 5s for `helperIsUsable()` and ~10s in the shell
+        /// helper's `stop`, which SIGINTs openconnect, waits 10s and only then escalates
+        /// to SIGTERM — the daemon's own `stopTunnel` does the same. That is ~38s, so 60s
+        /// cannot fire on a merely slow teardown and still recovers the menu in about a
+        /// minute rather than four. Reusing 240s here would leave the user with no way
+        /// back for four minutes, which matters more now that the escape hatch is not
+        /// offered during a disconnect.
+        var timeout: TimeInterval {
+            switch self {
+            case .connect:    return 240
+            case .disconnect: return 60
+            }
+        }
+
+        var noun: String {
+            switch self {
+            case .connect:    return "connect"
+            case .disconnect: return "disconnect"
+            }
+        }
+    }
+
     /// Last-resort guard against a permanently stuck UI.
     ///
     /// The authentication step is time-bounded now, so completion should always
     /// arrive. This exists because the cost of being wrong is a menu bar that never
     /// recovers, and the cost of the guard is a timer.
-    private func startBusyWatchdog() {
+    ///
+    /// Armed by every path that sets `busy = true`, and since it invalidates the
+    /// previous timer first, at most one can exist at a time.
+    private func startBusyWatchdog(_ kind: BusyKind) {
         stopBusyWatchdog()
-        busyWatchdog = Timer.scheduledTimer(withTimeInterval: 240, repeats: false) { [weak self] _ in
+        busyWatchdog = Timer.scheduledTimer(withTimeInterval: kind.timeout,
+                                            repeats: false) { [weak self] _ in
             guard let self = self, self.busy else { return }
-            NSLog("AnywayConnect: connect never completed; clearing busy state")
-            VPNRunner.shared.cancelInFlight()
+            NSLog("AnywayConnect: \(kind.noun) never completed; clearing busy state")
+            // Only a connect has an authentication child to kill. During a disconnect
+            // there is nothing to cancel — and interrupting the teardown is exactly how
+            // this app used to leave orphaned routes behind — so just unstick the UI and
+            // let the privileged side finish.
+            if case .connect = kind { VPNRunner.shared.cancelInFlight() }
+            self.stopBusyWatchdog()
             self.busy = false
             self.connectingKey = nil
-            self.notify("Connect gave up — see Logs")
+            self.notify("\(kind.noun.capitalized) gave up — see Logs")
             self.refresh()
         }
     }
@@ -992,7 +1075,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let profile = ConfigStore.shared.activeProfile else { notify("No active profile"); return }
         connectingKey = key
         busy = true; updateButton(); rebuildMenu()
-        startBusyWatchdog()
+        startBusyWatchdog(.connect)
         notify("Connecting to \(labelFor(key))… complete SSO in the browser.")
         VPNRunner.shared.connect(profile: profile, endpointKey: key, force: true) { [weak self] result in
             guard let self = self else { return }
@@ -1051,7 +1134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // while this runs — `busy` alone would otherwise be ambiguous.
         connectingKey = nil
         busy = true; updateButton(); rebuildMenu()
+        // A disconnect had no watchdog at all, which was survivable only because the
+        // "Stop" item used to appear on `busy` either way round. It no longer does —
+        // it cannot keep that promise during a teardown — so this timer is now the
+        // ONLY thing standing between a lost completion and a menu bar that never
+        // recovers short of quitting the app.
+        startBusyWatchdog(.disconnect)
         VPNRunner.shared.disconnect { [weak self] in
+            self?.stopBusyWatchdog()
             self?.busy = false; self?.notify("Disconnected"); self?.refresh()
         }
     }
@@ -1143,7 +1233,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusTitle: String
         let statusColor: NSColor
         switch stateForIcon() {
-        case .connecting:
+        // One title for both directions. The row says only that something is in
+        // flight; which direction it is shows in the items below it.
+        case .connecting, .disconnecting:
             statusTitle = "Working…"; statusColor = .systemOrange
         case .connected:
             statusColor = .systemGreen
@@ -1158,10 +1250,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let p = profile { addDisabled(menu, "Profile: \(p.name)", sym("folder")) }
         if case let .connected(_, host) = state { addDisabled(menu, host, sym("network")) }
 
-        // While busy, this is the only enabled action in the menu — every other
-        // item is disabled on `busy`. Without it a connect that never finishes left
-        // no way back short of quitting the app.
-        if busy {
+        // While a CONNECT is in flight this is the only action that can still change
+        // the connection — every other row that touches the connection is disabled on
+        // `busy`. Without it a connect that never finishes left no way back short of
+        // quitting the app.
+        //
+        // Gated on `connectingKey`, not on `busy`: `busy` is also true while
+        // DISCONNECTING, and there this item cannot do what it says. `cancelBusy()`
+        // kills the authentication child, which is a connect-only process; during a
+        // teardown there is none, so the click killed nothing, said "Cancelled", and
+        // the teardown carried on in the privileged daemon anyway. Hidden rather than
+        // disabled because the status row above already reads "Working…", so a greyed
+        // row would add nothing but noise.
+        //
+        // And deliberately NOT made to work instead: interrupting vpnc-script partway
+        // through is precisely how this app produced orphaned routes and a stale DNS
+        // override. A slow teardown is strictly better than a half-run one. The hung
+        // case is covered by `startBusyWatchdog(.disconnect)`, which clears the UI
+        // without touching the network.
+        if busy, connectingKey != nil {
             menu.addItem(.separator())
             let cancel = item("Stop Connecting", #selector(cancelBusy), ".", sym("stop.circle"))
             cancel.isEnabled = true
@@ -1180,11 +1287,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item("Refresh status", #selector(doRefresh), "r", sym("arrow.clockwise")))
             menu.addItem(.separator())
             menu.addItem(item("Quit AnywayConnect", #selector(quitApp), "q", sym("xmark.rectangle")))
-            return menu
+            return Self.showingImages(menu)
         }
 
         if case .connected = state {
-            menu.addItem(item("Disconnect", #selector(disconnectMenu), "d", sym("bolt.slash")))
+            let disc = item("Disconnect", #selector(disconnectMenu), "d", sym("bolt.slash"))
+            // `disconnectMenu()` returns immediately on `busy`, so mid-operation this
+            // row was live-looking and inert: clicking it did nothing, silently. And
+            // `state` is still `.connected` throughout a teardown, so this is exactly
+            // the row the user reaches for when a disconnect is taking its time.
+            disc.isEnabled = !busy
+            menu.addItem(disc)
             menu.addItem(.separator())
             addDisabled(menu, "Switch endpoint", sym("arrow.left.arrow.right"))
         } else {
@@ -1201,7 +1314,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let favs = p.endpoints.filter { $0.favorite }
             let pinned = favs.isEmpty ? p.endpoints : favs
             for ep in pinned {
-                // mark() decides the image: a tick for the one in use, nothing for the rest.
+                // mark() decides the image: a tick for the one in use, an empty column
+                // for the rest.
                 let it = item(ep.label, #selector(connectMenu(_:)), "", nil)
                 it.representedObject = ep.key; it.isEnabled = !busy
                 mark(it, ep.key)
@@ -1211,7 +1325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // listed above.
             if p.endpoints.count > pinned.count {
                 let allItem = NSMenuItem(title: "All endpoints", action: nil, keyEquivalent: "")
-                allItem.image = sym("list.bullet")
+                allItem.image = sym("list.bullet") ?? Self.blankMark
                 let allMenu = NSMenu()
                 allMenu.autoenablesItems = false
                 for ep in p.endpoints {
@@ -1233,11 +1347,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if cfg.profiles.count > 1 {
             menu.addItem(.separator())
             let profItem = NSMenuItem(title: "Profile", action: nil, keyEquivalent: "")
-            profItem.image = sym("folder")
+            profItem.image = sym("folder") ?? Self.blankMark
             let profMenu = NSMenu()
             for p in cfg.profiles {
                 // Same treatment as the endpoints: only the active one is ticked, and the
-                // rest are left unmarked rather than repeating a folder on every row.
+                // rest get the empty column rather than repeating a folder on every row.
                 let active = p.id == cfg.activeProfileID
                 let it = item(p.name, #selector(switchProfile(_:)), "",
                               active ? sym("checkmark") : nil)
@@ -1277,16 +1391,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `.rectangle`, which is landscape at 18x14, not `.square`/`.app` — those two are
         // the same 15x14 glyph as each other, so swapping between them changes nothing.
         menu.addItem(item("Quit AnywayConnect", #selector(quitApp), "q", sym("xmark.rectangle")))
+        return Self.showingImages(menu)
+    }
+
+    /// Ask AppKit to actually draw the images this menu has been given.
+    ///
+    /// macOS 27 took that decision away from the app: `NSMenuItem.image`'s own
+    /// documentation now says "AppKit determines the visibility of menu item images, and
+    /// will typically hide images", and what it hides in practice is every SF Symbol —
+    /// so the whole symbol column vanished while the drawn `statusDot` stayed. The
+    /// released v1.0.0 still shows its symbols on the same OS because the behaviour is
+    /// keyed to the SDK a binary was linked against (that build: 15.5, ours: 26.5+), so
+    /// nothing in this app's own history caused it and nothing in it can be reverted to
+    /// get the symbols back. The opt-out is `preferredImageVisibility = .visible`.
+    ///
+    /// Set through the ObjC runtime rather than the typed API because the property is
+    /// macOS 27 SDK-only, and build-app.sh compiles against whatever SDK the local
+    /// toolchain has — naming it directly would break the build on Xcode 26, and on
+    /// GitHub Actions, where v1.0.0 was built. `responds(to:)` makes it a no-op on
+    /// macOS 26 and earlier, which never hid these images in the first place.
+    ///
+    /// Applied to every item carrying an image, including the non-symbol status dot:
+    /// the documentation's "typically" promises nothing about what a later release will
+    /// keep drawing, and the one thing worth preventing is this happening again.
+    /// Recursive, so the "All endpoints" and "Profile" submenus are covered too.
+    private static func showingImages(_ menu: NSMenu) -> NSMenu {
+        for i in menu.items {
+            if i.image != nil, i.responds(to: Self.setPreferredImageVisibility) {
+                // NSMenuItemImageVisibilityVisible. Spelled as a number because the enum
+                // does not exist in the SDK this may be compiled against.
+                i.setValue(NSNumber(value: 1), forKey: "preferredImageVisibility")
+            }
+            if let sub = i.submenu { _ = showingImages(sub) }
+        }
         return menu
     }
+    private static let setPreferredImageVisibility = Selector(("setPreferredImageVisibility:"))
 
     /// Mark an endpoint row: connected, connecting, or neither.
     ///
     /// Only the endpoint you are on is marked. Giving every endpoint a globe filled the
     /// column with a glyph that said nothing — each row is an endpoint, so drawing that on
     /// all of them is noise, and it left the one row that mattered competing with a dozen
-    /// identical neighbours. Unmarked rows still line up: one image anywhere in the section
-    /// reserves the column for all of it.
+    /// identical neighbours. An unmarked row gets `blankMark`, not nil, which is what
+    /// keeps it lined up with its marked neighbours.
     ///
     /// Still a literal tick, as a macOS menu uses for "this is the current one" — the Wi-Fi
     /// menu included — but in the image column rather than the checkmark column beside it.
@@ -1305,20 +1453,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if busy, connectingKey == key {
             item.image = sym("ellipsis")
         } else {
-            item.image = nil
+            item.image = Self.blankMark
         }
     }
 
-    /// An SF Symbol for a menu row, or nil where a row is deliberately unmarked.
+    /// An SF Symbol for a menu row, or nil if this OS does not have that symbol.
     ///
-    /// A row's image is what sets the title's left edge. A menu reserves that column per
-    /// section between separators, so a section needs only *one* image for every title in
-    /// it to line up — which is why unmarked rows still sit correctly beside marked ones.
+    /// A row's image is what sets the title's left edge, and on macOS 27 that is *per
+    /// row*: a nil image means no indent at all. It did not used to be — a menu reserved
+    /// the column per section between separators, so one image anywhere in a section
+    /// lined up every title in it, which is why unmarked rows used to sit correctly
+    /// beside marked ones. That reservation is gone (the same image-visibility change
+    /// `showingImages(_:)` works around), and without it the three endpoint rows, nil
+    /// while disconnected, sat 22pt left of every other row in the menu. So nil from
+    /// here is turned into `blankMark` by whoever assigns it, and the only rows with a
+    /// genuinely absent image are the ones AppKit never draws anyway.
+    ///
     /// macOS 26 supplies a gear for "Settings…" unasked, and it was that lone image
     /// indenting one section and nothing else that made the padding look arbitrary.
     private func sym(_ name: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
+
+    /// The image column, reserved but empty: a fully transparent image in the same
+    /// geometry a real mark occupies.
+    ///
+    /// Only the endpoint you are on carries a tick, and only one profile is active, so
+    /// most rows in those two sections have nothing to show. Before macOS 27 they could
+    /// be left nil and still line up; now a nil image collapses that row's title flush
+    /// to the menu's left edge, and a menu with marked and unmarked rows in it ends up
+    /// with two different left edges. This is what an unmarked row gets instead.
+    ///
+    /// Transparent rather than, say, a dimmed glyph: the row has nothing to say, and the
+    /// only job here is the 22pt the column is worth. Nothing is drawn into the bitmap,
+    /// so it cannot be a visible blob in either appearance, and at the same 16pt as
+    /// `statusDot` it cannot change a row's height either.
+    ///
+    /// A `static let`, because the menu is rebuilt on every 8s status poll and this would
+    /// otherwise be a fresh allocation per unmarked row per rebuild. Appearance-
+    /// independent, unlike `statusDot`, so there is nothing to invalidate.
+    ///
+    /// `showingImages(_:)` will tell this one to be visible along with the rest. That is
+    /// harmless — there is nothing in it to see.
+    private static let blankMark: NSImage = {
+        let img = NSImage(size: NSSize(width: 16, height: 16))
+        // Gives it a real, fully transparent representation; an NSImage with no
+        // representation at all is not reliably treated as an image to make room for.
+        img.lockFocus()
+        img.unlockFocus()
+        return img
+    }()
 
     /// A coloured status dot, drawn rather than borrowed from SF Symbols.
     ///
@@ -1340,17 +1524,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
+    // Both of these fall back to `blankMark` rather than leaving the image nil, so that
+    // every row this menu can emit reserves the column — including a row passed nil
+    // deliberately, and a row whose `sym(_:)` came back nil because the symbol is not on
+    // this OS. One left edge per menu, in every state.
     private func addDisabled(_ menu: NSMenu, _ title: String, _ image: NSImage?) {
         let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         i.isEnabled = false
-        i.image = image
+        i.image = image ?? Self.blankMark
         menu.addItem(i)
     }
     private func item(_ title: String, _ action: Selector, _ key: String,
                       _ image: NSImage?) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
         i.target = self
-        i.image = image
+        i.image = image ?? Self.blankMark
         return i
     }
 

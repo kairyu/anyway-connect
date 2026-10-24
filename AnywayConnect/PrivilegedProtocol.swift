@@ -281,4 +281,17 @@ public enum PrivilegedValidation {
     public static func isValidInterface(_ s: String) -> Bool {
         !s.isEmpty && s.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber) }
     }
+
+    /// `isValidInterface`, plus the two things a target for a default-route
+    /// INSTALL must additionally satisfy: a length the kernel can hold
+    /// (IFNAMSIZ - 1), and not being a tunnel (FR-1.8 — restoring the physical
+    /// default onto a utun is the failure this change exists to stop).
+    ///
+    /// Strictly additive: `isValidInterface` is unchanged and is still applied
+    /// first everywhere it was before.
+    public static func isRestoreTargetInterface(_ s: String) -> Bool {
+        guard isValidInterface(s), s.utf8.count <= 15 else { return false }
+        for p in ["utun", "ppp", "ipsec", "gif", "stf"] where s.hasPrefix(p) { return false }
+        return true
+    }
 }

@@ -35,6 +35,32 @@ HELPER_LABEL="${APP_ID}.privhelper"
 HELPER_BIN="$HELPER_LABEL"
 SRC_DIR="AnywayConnect"
 HELPER_SRC_DIR="AnywayConnectHelper"
+
+# --- Deployment target -------------------------------------------------------
+# swiftc with no -target compiles for the TOOLCHAIN's default minimum, not for
+# anything this project chose. On Swift 6.3 that default is macOS 28, so a build
+# on a macOS 27 machine produced binaries stamped `minos 28.0` that the very
+# machine that built them refuses to launch:
+#
+#     You can't use this version of the application "AnywayConnect.app"
+#     with this version of macOS.
+#
+# Finder's message is accurate; `open` reports a misleading -10825, and running
+# the executable directly still works, which makes this easy to misdiagnose as
+# a signing or notarization problem. It is not. launchd enforces `minos` as
+# well, so the privileged daemon would also silently fail to start.
+#
+# Pinned to the same floor the Info.plist advertises, and both are written from
+# this one variable so they cannot drift apart again. The arch is taken from the
+# host rather than hardcoded so this keeps working on Intel.
+# 14.0, not the 13.0 the Info.plist used to claim: SettingsWindow.swift calls
+# NSViewController.loadViewIfNeeded() and NSApplication.activate(), both of which
+# are macOS 14.0+. Compiling at 13.0 fails with ten availability errors, so the
+# advertised floor was never real — and the released v1.0.0 shipped `minos 15.0`
+# while still advertising 13.0, which would have given anyone on macOS 13 or 14
+# the same launch refusal. Raise this only alongside the APIs in use.
+MIN_OS="${ANYWAY_MIN_MACOS:-14.0}"
+TARGET="$(uname -m)-apple-macos${MIN_OS}"
 # --- Pick a signing identity -------------------------------------------------
 # Auto-detected rather than hardcoded: naming one developer's certificate here
 # would leak their identity into the repo and break the build for everyone else.
@@ -84,10 +110,15 @@ fi
 # "1.0.0". The full string goes in CFBundleVersion, which is where a development build
 # can say precisely what it is; the About panel shows it in parentheses when the two
 # differ, and shows nothing extra when they agree.
-SHORT_VERSION=$(printf '%s' "$VERSION" | sed -n 's/^\([0-9][0-9.]*\).*/\1/p')
+# Anchored at BOTH ends so only a genuine dotted-numeric version, optionally with a
+# "-suffix", contributes. The previous pattern took the leading digits of whatever it
+# was given, so an untagged build -- where `git describe --always` yields a bare hash --
+# advertised the hash's own digits as its version: "41544e3" became 41544, "1499fe7"
+# became 1499. A hash now falls through to the 0.0.0 fallback, which is at least honest.
+SHORT_VERSION=$(printf '%s' "$VERSION" | sed -n 's/^\([0-9][0-9.]*\)\(-.*\)\{0,1\}$/\1/p')
 [ -n "$SHORT_VERSION" ] || SHORT_VERSION="0.0.0"
 
-echo "Building $FINAL (signing: $SIGN_MODE, version: $SHORT_VERSION, build: $VERSION)"
+echo "Building $FINAL (signing: $SIGN_MODE, version: $SHORT_VERSION, build: $VERSION, target: $TARGET)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchDaemons"
 
@@ -104,7 +135,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>${SHORT_VERSION}</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>$BIN</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>${MIN_OS}</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
@@ -135,6 +166,7 @@ PLIST
 # --- Compile the privileged daemon -------------------------------------------
 echo "  compiling $HELPER_BIN"
 /usr/bin/swiftc -O \
+    -target "$TARGET" \
     -framework Foundation \
     -o "$APP/Contents/MacOS/$HELPER_BIN" \
     "$SRC_DIR/PrivilegedProtocol.swift" \
@@ -145,6 +177,7 @@ echo "  compiling $HELPER_BIN"
 # --- Compile the app ---------------------------------------------------------
 echo "  compiling $BIN"
 /usr/bin/swiftc -O \
+    -target "$TARGET" \
     -framework AppKit -framework Foundation -framework ServiceManagement \
     -framework Network \
     -o "$APP/Contents/MacOS/$BIN" \
@@ -175,6 +208,7 @@ echo "  drawing $BIN.icns"
 ICON_TMP=$(mktemp -d)
 trap 'rm -rf "$ICON_TMP"' EXIT
 /usr/bin/swiftc -O \
+    -target "$TARGET" \
     -framework AppKit -framework Foundation \
     -o "$ICON_TMP/make-iconset" \
     "$SRC_DIR/AppIcon.swift" \

@@ -43,8 +43,26 @@ case "$SHORT" in
     *) ok "version: $SHORT (build $BUILDV)" ;;
 esac
 if [ -n "${EXPECT_VERSION:-}" ]; then
-    [ "$SHORT" = "${EXPECT_VERSION#v}" ] && ok "version matches the expected ${EXPECT_VERSION#v}" \
-        || bad "version is $SHORT but ${EXPECT_VERSION#v} was expected"
+    EXPECTED="${EXPECT_VERSION#v}"
+    # Two fields, two different promises, and conflating them failed a correct bundle.
+    #
+    # CFBundleVersion carries the tag verbatim. CFBundleShortVersionString carries only
+    # its dotted-numeric part, because Apple expects dotted integers there and
+    # build-app.sh strips any SemVer pre-release suffix accordingly. For a final tag
+    # like v1.0.0 the two are identical, which is why comparing the short version
+    # against the whole tag passed for every release this project ever made — and why
+    # v1.0.1-rc.1, the first hyphenated tag, was rejected with "version is 1.0.1 but
+    # 1.0.1-rc.1 was expected" while the bundle was in fact exactly right.
+    #
+    # So assert each against what it actually promises: the full tag in CFBundleVersion,
+    # and the tag's dotted prefix in the short version.
+    [ "$BUILDV" = "$EXPECTED" ] \
+        && ok "build version matches the expected $EXPECTED" \
+        || bad "build version is $BUILDV but $EXPECTED was expected"
+    EXPECTED_SHORT="${EXPECTED%%-*}"
+    [ "$SHORT" = "$EXPECTED_SHORT" ] \
+        && ok "version matches the expected $EXPECTED_SHORT" \
+        || bad "version is $SHORT but $EXPECTED_SHORT was expected"
 fi
 
 # --- Icon -------------------------------------------------------------------

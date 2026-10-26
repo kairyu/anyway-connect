@@ -1,10 +1,23 @@
 name: Release
 
-# Signed, notarized, stapled build attached to a GitHub release.
+# Signed, notarized, stapled build attached to a GitHub release, and — behind a manual
+# approval — published to the Homebrew tap.
 #
 # Runs only on a version tag, because unlike CI this needs secrets and Apple's
 # notarization service, and it cannot work on a fork or from a pull request — secrets are
 # not exposed there by design.
+#
+# Two jobs rather than one, because the tap push has to wait for a person and a *step*
+# cannot be gated on one. GitHub's only manual gate is an environment protection rule,
+# and an environment attaches to a job. So `release` builds, notarizes and publishes
+# with no interruption, and `publish-tap` — which does nothing but copy one text file
+# into kairyu/homebrew-tap — sits behind the `homebrew-tap` environment and its required
+# reviewer.
+#
+# A hyphen in the tag means SemVer pre-release, and that is the whole lever for
+# releasing without releasing: `v1.0.1-rc.1` is built, notarized, Gatekeeper-checked and
+# published here as a prerelease and NEVER reaches the tap or asks anyone to approve
+# anything, while `v1.0.1` stops at the gate until the owner approves.
 #
 # Required repository secrets:
 #
@@ -15,6 +28,7 @@ name: Release
 #   APPLE_API_KEY           App Store Connect API key (.p8), base64 encoded
 #   APPLE_API_KEY_ID        its Key ID
 #   APPLE_API_ISSUER_ID     the issuer UUID from App Store Connect
+#   HOMEBREW_TAP_DEPLOY_KEY SSH private key of a write-enabled deploy key on the tap
 #
 # The signing identity itself is not a secret: build-app.sh finds it in the keychain.
 # The keychain password is generated per run rather than stored, since it protects
@@ -32,8 +46,21 @@ jobs:
   release:
     runs-on: macos-15
 
+    # What publish-tap needs in order to decide whether to run at all, and what to name
+    # its commit. Declared here rather than re-derived over there, so "was this
+    # notarized" and "what version is this" are each answered in exactly one place.
+    outputs:
+      notarized: ${{ steps.notarize.outputs.notarized }}
+      version: ${{ steps.meta.outputs.version }}
+
     steps:
       - uses: actions/checkout@v5
+
+      - name: Derive the version
+        id: meta
+        run: |
+          set -eu
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install openconnect (for vpnc-script)
         run: brew install openconnect
@@ -109,7 +136,12 @@ jobs:
       # Deliberately loud rather than silent. An unnotarized build looks identical to a
       # notarized one until someone else tries to open it, at which point Gatekeeper
       # refuses it — so the warning, the prerelease flag and the release notes all say so.
+      #
+      # Written to GITHUB_OUTPUT as well as GITHUB_ENV: the env copy is what the later
+      # steps in this job test, the output is what publish-tap's `if` tests, and a job
+      # cannot read another job's env.
       - name: Notarize and staple
+        id: notarize
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
@@ -119,6 +151,7 @@ jobs:
           if [ -z "${APPLE_API_KEY:-}" ] || [ -z "${APPLE_API_KEY_ID:-}" ] \
              || [ -z "${APPLE_API_ISSUER_ID:-}" ]; then
             echo "NOTARIZED=false" >> "$GITHUB_ENV"
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Not notarized::No App Store Connect API key is configured, so this release is signed but NOT notarized. Gatekeeper will refuse it on any machine that did not build it, and Homebrew cannot install it. Set APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID to enable notarization."
             exit 0
           fi
@@ -133,6 +166,7 @@ jobs:
           # diverge.
           ANYWAY_NOTARY_PROFILE=anyway-notary sh scripts/notarize.sh AnywayConnect.app
           echo "NOTARIZED=true" >> "$GITHUB_ENV"
+          echo "notarized=true" >> "$GITHUB_OUTPUT"
 
       - name: Confirm Gatekeeper accepts it
         if: env.NOTARIZED == 'true'
@@ -163,9 +197,19 @@ jobs:
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
           if [ "${NOTARIZED:-false}" = "true" ]; then
+            # A hyphen in the tag means SemVer pre-release, and that is flagged here even
+            # though the build is fully notarized and installable — because Homebrew's
+            # :github_latest livecheck ignores prereleases, which is what stops a release
+            # candidate becoming the version a cask resolves to. publish-tap refuses
+            # hyphenated tags for the same reason, from the other direction.
+            case "$GITHUB_REF_NAME" in
+              *-*) PRERELEASE=yes ;;
+              *)   PRERELEASE= ;;
+            esac
             gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
               --title "$GITHUB_REF_NAME" \
-              --generate-notes
+              --generate-notes \
+              ${PRERELEASE:+--prerelease}
             exit 0
           fi
 
@@ -187,9 +231,57 @@ jobs:
             --notes-file /tmp/notes.md
 
       # The cask is rendered from the same script used by hand, and attached to the
-      # release as well as pushed, so the exact text that describes a release is
-      # recoverable from the release itself.
+      # release here rather than in publish-tap, so the exact text that describes a
+      # release is recoverable from the release itself even when the tap is never
+      # updated — a rejected approval, a hyphenated tag, or a missing deploy key all
+      # leave this asset in place.
       #
+      # It is also what publish-tap publishes: it downloads this asset rather than
+      # re-rendering, which is one fewer moving part and proves that the file on the
+      # release is the file that reaches the tap.
+      - name: Render the cask and attach it to the release
+        if: env.NOTARIZED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
+          sh scripts/make-cask.sh "$VERSION" "$SHA" > anyway-connect.rb
+          echo "--- rendered cask ---"; cat anyway-connect.rb
+          gh release upload "$GITHUB_REF_NAME" anyway-connect.rb
+
+      # Runs even when something above failed, so a failed release does not leave a
+      # private key sitting on the runner.
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
+
+  # The manual gate. Everything above has already happened and is already public by the
+  # time this is asked for; all that waits here is the copy into the tap, which is the
+  # only part that changes what `brew upgrade` gives other people.
+  #
+  # ubuntu-latest, not macOS: this needs git, ssh and gh and nothing from the Apple
+  # toolchain, so there is no reason to pay ten times the rate or queue for a macOS
+  # runner to move one text file.
+  publish-tap:
+    needs: release
+    # `needs` without always() already means this is skipped unless release succeeded;
+    # the conditions here are the two cases where a *successful* release still must not
+    # reach the tap.
+    #
+    # Evaluated before the environment's protection rule, so a tag that fails these is
+    # skipped outright and nobody is ever asked to approve a deployment that would do
+    # nothing. That is what makes `v1.0.1-rc.1` a silent, no-prompt release.
+    if: needs.release.outputs.notarized == 'true' && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment are the whole mechanism: the job reaches
+    # "Waiting" and stays there until a reviewer approves it in the run's page.
+    environment: homebrew-tap
+    permissions:
+      contents: read   # only to download the cask asset the release job attached
+
+    steps:
       # Pushing to a *different* repository needs its own credential: the automatic
       # github.token is scoped to this one. That credential is an SSH **deploy key** on
       # the tap rather than a personal access token, chosen for how little it can do — a
@@ -198,26 +290,26 @@ jobs:
       # scope would hand over write access to everything the account owns in order to
       # publish one text file.
       #
-      # Without the key set, the cask is still rendered and attached and only the push is
-      # skipped, so a release never fails over a tap that may not exist yet.
+      # Without the key set, nothing here can run, but the cask is already rendered and
+      # attached to the release by the job above, so a release never fails over a tap
+      # that may not exist yet.
       - name: Update the Homebrew tap
-        if: env.NOTARIZED == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_REPO: kairyu/homebrew-tap
+          VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -eu
-          VERSION="${GITHUB_REF_NAME#v}"
-          SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
-          sh scripts/make-cask.sh "$VERSION" "$SHA" > anyway-connect.rb
-          echo "--- rendered cask ---"; cat anyway-connect.rb
-          gh release upload "$GITHUB_REF_NAME" anyway-connect.rb
-
           if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
             echo "::notice::HOMEBREW_TAP_DEPLOY_KEY not set — cask attached to the release but tap not updated"
             exit 0
           fi
+
+          # The asset the release job attached, not a re-render: whatever is published on
+          # the release is byte-for-byte what lands in the tap.
+          gh release download "$GITHUB_REF_NAME" --pattern anyway-connect.rb
+          echo "--- cask from the release ---"; cat anyway-connect.rb
 
           KEYFILE="$RUNNER_TEMP/tap_deploy_key"
           printf '%s\n' "$TAP_DEPLOY_KEY" > "$KEYFILE"
@@ -246,9 +338,3 @@ jobs:
           git commit -m "anyway-connect ${VERSION}"
           git push
           rm -f "$KEYFILE"
-
-      # Runs even when something above failed, so a failed release does not leave a
-      # private key sitting on the runner.
-      - name: Remove the keychain
-        if: always()
-        run: security delete-keychain "$KEYCHAIN" || true

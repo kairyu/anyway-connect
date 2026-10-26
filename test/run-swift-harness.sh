@@ -190,15 +190,50 @@ fi
 # ── Run ─────────────────────────────────────────────────────────────────────
 #
 # ANYWAY_SINGLE_INSTANCE=0 because otherwise SingleInstance hands off to the
-# already-running app and this exits immediately; under `timeout` because a
+# already-running app and this exits immediately; under a bound because a
 # harness that waited on a run loop would hang. The two paths are passed in
 # rather than guessed: the binary runs from /tmp and has no idea where the
 # worktree is.
-( cd "$D" && ANYWAY_SINGLE_INSTANCE=0 \
+#
+# THE BOUND IS HAND-ROLLED BECAUSE macOS SHIPS NO timeout(1). `timeout 120 ./a`
+# ran green on the author's machine, where Homebrew coreutils puts one on PATH,
+# and exited 127 ("timeout: command not found") on every CI runner — after the
+# 34-second compile, so the suites never ran at all and the step still went red.
+# Same shape as bounded() in scripts/anyway-diag.sh: run it in the background,
+# poll, and take it out if it overruns. Output is deliberately NOT redirected,
+# so the harness's own per-suite lines stay in the log.
+#
+# `$!` is the pid of `./a` itself and not of a wrapper: the env assignments
+# prefix a simple command, which the shell execs without an intervening
+# subshell. Nothing below reads the working directory, and $D is absolute.
+cd "$D" || exit 1
+ANYWAY_SINGLE_INSTANCE=0 \
     ANYWAY_FIXTURES="$ROOT/test/fixtures" \
     ANYWAY_EXPECTED="$ROOT/test/harness/expected" \
-    timeout 120 ./a )
-status=$?
+    ./a &
+run_pid=$!
+i=0
+while [ "$i" -lt 1200 ]; do                # 1200 × 0.1s ≈ the old 120s bound
+    kill -0 "$run_pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+done
+if kill -0 "$run_pid" 2>/dev/null; then
+    # Only ever our own child, started above. The group is wrapped in
+    # `2>/dev/null` and not just the `kill`s, because the shell prints
+    # "Terminated: 15" when it reaps a signalled job.
+    {
+        kill -TERM "$run_pid"
+        sleep 0.3
+        kill -KILL "$run_pid"
+        wait "$run_pid"
+    } 2>/dev/null
+    echo "harness did not finish within the bound" >&2
+    status=124
+else
+    wait "$run_pid"
+    status=$?
+fi
 
 rm -f "$D"/*.swift "$D"/*.png
 exit "$status"

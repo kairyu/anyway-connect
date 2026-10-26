@@ -37,8 +37,11 @@ sh test/run-swift-harness.sh          # expect "N passed, 0 failed"
    file a harness must not copy, because Swift allows top-level statements only
    in `main.swift` and the harness supplies its own — together with
    `test/harness/*.swift`.
-5. **Runs** the binary under `timeout`, with `ANYWAY_SINGLE_INSTANCE=0` so it
-   does not hand off to the already-running app and exit.
+5. **Runs** the binary under a time bound, with `ANYWAY_SINGLE_INSTANCE=0` so it
+   does not hand off to the already-running app and exit. The bound is
+   hand-rolled (background, poll, kill on overrun) rather than `timeout 120`,
+   because macOS ships no `timeout(1)` — only a machine with Homebrew coreutils
+   has one, which is why that version passed locally and exited 127 on CI.
 
 The scratch path is **fixed** at `/tmp/anyway-scratch` and the binary is
 **always** named `a`. Each distinct executable path costs the developer a

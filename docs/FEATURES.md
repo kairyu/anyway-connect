@@ -714,19 +714,131 @@ the daemon cannot register and the app uses its sudo path.
 
 ## CI and releases
 
-Two workflows, split by whether they need Apple.
+Two workflows, split by what they publish: `ci.yml` publishes artifacts and release
+candidates, `release.yml` publishes releases and the cask.
+
+### Versioning — the `VERSION` file
+
+A file at the repository root holding **dotted integers and nothing else**. The
+format is *enforced*, not conventional: a leading `v`, an `-rc` suffix, a trailing
+space, a CRLF line ending, an empty component or an empty file each **fail** the
+gate job rather than warn.
+
+Shipping is "edit `VERSION` and merge":
+
+- **A same-repo pull request whose `VERSION` differs from its base** publishes
+  `v<VERSION>-rc.<run_number>` as a GitHub **prerelease**, carrying the notarized
+  bundle that run already built. The tap is never touched and no approval is
+  requested.
+- **That same change reaching `main`** creates the **annotated** tag `v<VERSION>`
+  and runs the real release, which stops at the `homebrew-tap` approval.
+- **An unchanged `VERSION` releases nothing**, which is the ordinary case, and says
+  nothing in the run summary either.
+
+The change is detected from the **file's contents at two commits**, never from a
+commit message, a pull request title or a label. On a pull request the payload names
+both sides (`base.sha` and `head.sha`). On a push to `main` the base is
+`github.event.before` — `main`'s tip before this push — rather than the tip's first
+parent, which is what makes every merge strategy behave identically: "rebase and
+merge" pushes N commits at once, and against the first parent a bump sitting in any
+but the last commit would compare equal and release nothing, silently. Absence of
+the file at the base counts as a change; deleting it is a refusal.
+
+`VERSION` and the git tag cannot drift, by five mechanisms rather than one: the tag
+is computed from the file and never typed; `EXPECT_VERSION` makes
+`verify-bundle.sh` assert the built bundle agrees before anything is published; an
+existing tag is refused rather than moved; a version that has already been released
+is refused new release candidates; and a hand-pushed tag is checked against the file
+at its own commit.
+
+Monotonicity is **not** enforced. `1.0.1` → `0.9` passes, and once merged and
+approved would put a lower version in the tap. The gate refuses values that are
+*unusable* or *already used*; a deliberate downgrade — including correcting a
+mistakenly-high number before anything shipped — is a decision a human is allowed to
+make, and a gate that second-guessed it would block the legitimate case too.
+
+Local builds are unaffected: `./build-app.sh` still derives its version from
+`git describe`, which describes where the working tree sits relative to the last tag
+that actually shipped. `ANYWAY_VERSION="v$(cat VERSION)" ./build-app.sh` asks for the
+file's value explicitly.
+
+#### Trigger matrix
+
+`R` = release created, `P` = prerelease, `T` = tag created by the workflow,
+`A` = approval requested, `TAP` = cask pushed to the tap.
+
+| Event | R | P | T | A | TAP |
+| --- | --- | --- | --- | --- | --- |
+| push to `main`, `VERSION` changed | yes | no | yes, annotated `v<VERSION>` | **yes** | after approval |
+| push to `main`, `VERSION` unchanged | no | — | no | no | no |
+| same-repo PR, `VERSION` changed | yes | **yes** | yes, lightweight, at the PR head | no | no |
+| same-repo PR, `VERSION` unchanged | no | — | no | no | no |
+| fork PR, either way | no | — | no | no | no |
+| tag pushed by hand, `v1.0.3` | yes | no | no — it already exists | **yes** | after approval |
+| tag pushed by hand, `v1.0.3-rc.1` | yes | **yes** | no | no | no |
+| `workflow_dispatch` on a `v*` tag | yes | per hyphen | no | per hyphen | per hyphen |
+| `workflow_dispatch` on a branch | no | — | no | no | no — the gate fails with an explanation |
+
+#### Refusals
+
+Each of these is a **red, failing job** with an `::error::` annotation, and each
+yields no release, no tag, no approval and no tap push:
+
+- `VERSION` is not dotted integers, is empty, or has a leading/trailing/doubled dot.
+- A pull request or a push deletes `VERSION` while the other side has one.
+- `v<VERSION>` already exists on `origin` — a released version does not get new
+  release candidates, and a tag is never moved.
+- The computed tag exists at a **different** commit.
+- A hand-pushed tag disagrees with `VERSION` at that commit.
+- `workflow_dispatch` is run against a branch rather than a tag.
+- A push to `main` whose base commit is not in the clone, which is what a
+  force-pushed `main` looks like. Recover by pushing the `v<VERSION>` tag by hand.
+- A VERSION-driven release whose build is **not notarized**: no tag is created and
+  nothing is published, so the version number is not spent on a build Gatekeeper
+  would refuse and the same value can be retried.
+
+A fork pull request is **skipped, not failed** — it gets no certificate and no
+notary key by GitHub's design, so the fork test runs before the file is even read.
 
 ### CI — `.github/workflows/ci.yml`
 
-Runs on every push and pull request, on `macos-15` and `macos-26`. Both are worth
-covering: the deployment target is macOS 13, so the older image is what catches use
-of an API newer than that target, while the newer one is what development actually
-happens on.
+Runs on pull requests, on pushes to `main`, and on demand. (Which pushes run CI
+matters more than it looks: pushing a branch starts nothing, so the first run a
+branch gets is its pull request's.) **Three jobs.**
+
+**`build`** — the matrix, on `macos-15` and `macos-26`, and the **only one that
+gates a merge**. Both images are worth covering: `build-app.sh` pins a macOS 14
+deployment floor, so the older image catches use of an API newer than that target,
+while the newer one is what development actually happens on. It also caught a real
+portability bug, which is why it is kept byte-identical through changes like this
+one.
 
 It needs **no secrets**, which is what lets it run on forks and pull requests. With
 no Developer ID in the keychain `build-app.sh` warns and signs ad-hoc — a valid
 bundle that simply cannot register the privileged daemon. Ad-hoc signing tolerates
 `--timestamp` and `--options runtime`, so the build script needs no special case.
+
+**`version-gate`** — secret-free, read-only, `ubuntu-latest`. Decides from the
+`VERSION` file's own contents whether this run publishes a release candidate, and at
+which commit. Quiet by default: when `VERSION` did not move it writes nothing at
+all.
+
+**`signed-build`** — needs the certificate, builds on `macos-15` to match the
+release exactly, notarizes, staples, Gatekeeper-checks, and uploads
+**`AnywayConnect-installable`**: the only artifact on the run that will launch on a
+machine other than the runner, and the only one that can register the privileged
+daemon. When `version-gate` says there is a release candidate, this job also
+attaches those same bytes to a prerelease — the artifact a human installs and the
+bundle on the release are then the same bytes, not two builds that ought to be
+equivalent.
+
+It carries `continue-on-error: true`, because notarization is an external Apple
+queue and must never be what stops a merge. The honest cost: **a failure here is
+reported as a *success*** by the run conclusion, the commit status and the pull
+request's checks summary. The mitigation is the run summary — the job writes a
+`:rotating_light:` banner into it under `if: failure()`, which is the one surface on
+the run that says so. "No `AnywayConnect-installable` artifact" remains the
+corroborating signal.
 
 It installs `openconnect` purely for its `vpnc-script`. A missing one is only a
 warning to `build-app.sh`, so without that step the DNS patch — and the check that
@@ -764,12 +876,46 @@ unsigned CI build is expected to be both ad-hoc and unnotarized.
 
 ### Release — `.github/workflows/release.yml`
 
-Triggered by a `v*` tag. Imports the certificate into a throwaway keychain, builds,
-refuses to continue unless the signature really is a Developer ID one, verifies,
-tests, notarizes, staples, confirms Gatekeeper reports
-`source=Notarized Developer ID`, and attaches the zip plus its SHA-256 to a GitHub
-release. The keychain is deleted in an `if: always()` step, so a failed release does
-not leave a private key on the runner.
+Three triggers, and they do different things:
+
+- **a push to `main`** releases only when the `VERSION` file's value changed in that
+  push. This is what shipping is;
+- **a hand-pushed `v*` tag** releases under that name, and is the escape hatch when
+  `main`'s history has been rewritten or a release has to be made from a commit
+  `main` has moved past;
+- **`workflow_dispatch`** against a `v*` tag, for re-running a release. Against a
+  branch it fails at the gate with an explanation, rather than building for several
+  minutes and then being rejected by `EXPECT_VERSION`.
+
+**Three jobs**, `gate` → `release` → `publish-tap`, and the manual approval sits on
+`publish-tap` only.
+
+`gate` (`ubuntu-latest`, `contents: read`) decides what is being released and under
+which tag, and creates nothing.
+
+`release` imports the certificate into a throwaway keychain, builds, refuses to
+continue unless the signature really is a Developer ID one, verifies the bundle
+against the tag through `EXPECT_VERSION`, tests, notarizes, staples, confirms
+Gatekeeper reports `source=Notarized Developer ID`, **then** creates the annotated
+tag, and attaches the zip plus its SHA-256 and the rendered cask to a GitHub
+release. The tag is created last on purpose: everything that could refuse the
+release has already had its chance, so a tag only ever appears on a commit that
+produced a releasable bundle. On the VERSION-driven path the tag is additionally
+gated on notarization, because there the tag *is* the version number and spending it
+on a build Gatekeeper refuses would burn it.
+
+The keychain is deleted in an `if: always()` step, so a failed release does not leave
+a private key on the runner. A run summary names the release, the tag, the prerelease
+flag, the assets, the zip's SHA-256, and in one line whether the tap is going to
+change.
+
+`publish-tap` does nothing but copy one text file into `kairyu/homebrew-tap`, and it
+sits behind the `homebrew-tap` environment and its required reviewer: the job reaches
+*Waiting* and stays there until the owner approves it on the run page. It is skipped
+outright — with no prompt — for a prerelease (a hyphen in the version) or an
+unnotarized build. An absent `HOMEBREW_TAP_DEPLOY_KEY` degrades rather than fails:
+the cask is already attached to the release, so the tap is simply left alone and the
+run summary says so.
 
 Secrets required:
 

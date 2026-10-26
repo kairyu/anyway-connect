@@ -1,6 +1,8 @@
 name: CI
 
-# Build and test on every push and pull request.
+# Build and test on pull requests, on pushes to `main`, and on demand. (Not on every
+# push: the `push` trigger below is restricted to `main`, which is also why pushing a
+# branch starts nothing until its pull request is opened.)
 #
 # The `build` matrix deliberately needs no secrets, so it runs on forks and pull
 # requests too. With no Developer ID in the keychain, build-app.sh warns and signs
@@ -11,6 +13,13 @@ name: CI
 # `signed-build` is the exception and is additive: one extra job that does need secrets,
 # producing the one artifact a person can actually install. It is skipped on forks and
 # cannot block a merge, so none of the above changes for a fork contributor.
+#
+# A third job, `version-gate`, sits between them. It is secret-free and read-only and
+# does one thing: decide from the VERSION file's own contents whether this run publishes
+# a release candidate. When it says yes, `signed-build` attaches the bundle it already
+# built to a GitHub prerelease; when it says no — the ordinary case — nothing is
+# published and nothing is said. Shipping is "edit VERSION and merge"; see
+# docs/FEATURES.md#ci-and-releases.
 
 on:
   push:
@@ -21,7 +30,10 @@ on:
 permissions:
   contents: read
 
-# A newer push makes an in-flight run pointless.
+# A newer push makes an in-flight run pointless. Kept as cancel-in-progress even though
+# signed-build can now be killed mid-publish: a superseded run sitting in Apple's notary
+# queue for twenty minutes is a worse trade. The two states a cancellation can leave are
+# compensated for — see "Withdraw a half-created release candidate" below.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -104,6 +116,229 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Decides, from the VERSION file's contents alone, whether this run publishes a
+  # release candidate — and at which commit. Never from a commit message, a pull
+  # request title or a label: those are text a human types and can get wrong, and a
+  # release that fires on a typo'd subject line is both a false positive and a false
+  # negative waiting to happen. The file is the thing the release is named after, so
+  # the file is the input.
+  #
+  # Secret-free and read-only, so it runs on forks too — and a fork is the FIRST thing
+  # it tests, before it so much as reads the file. A fork pull request gets no signing
+  # certificate and no notary key by GitHub's design, so there is nothing it could
+  # publish, and a red job for a VERSION it cannot usefully release is noise a
+  # contributor cannot act on. VERSION is still validated — on `main`, where a
+  # malformed value blocks the release rather than the pull request, and on every
+  # same-repo pull request, which is how a bad value is stopped before it gets there.
+  #
+  # This job is also why `signed-build` gained `needs:`. A refusal here has to stop the
+  # build rather than merely annotate it: a VERSION the release machinery cannot parse
+  # should not be given twenty minutes of runner time and a slot in Apple's notary
+  # queue.
+  #
+  # ubuntu-latest: this is git plumbing and nothing else. Nothing from the Apple
+  # toolchain, so there is no reason to queue for a macOS runner.
+  version-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      rc: ${{ steps.detect.outputs.rc }}                  # 'yes' only for a same-repo PR that bumped VERSION
+      tag: ${{ steps.detect.outputs.tag }}                # WITH the leading v: v1.0.2-rc.13
+      rc_version: ${{ steps.detect.outputs.rc_version }}  # WITHOUT it: 1.0.2-rc.13
+      target: ${{ steps.detect.outputs.target }}          # the PR's HEAD commit — never the merge ref
+    steps:
+      # fetch-depth: 0 because the comparison needs the VERSION blob at the base commit
+      # as well as at the head, and a pull_request run checks out the *merge ref* whose
+      # default shallow fetch contains neither. The whole repository is 1.2 MB of .git,
+      # so this costs seconds — and it is the reason the detection lives here rather
+      # than in `signed-build`, whose shallow checkout is a documented property worth
+      # keeping.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect a VERSION change
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          # The pull_request payload names both sides of the comparison outright, which
+          # is why this path never has to walk a parent. PR_BASE is the base branch's
+          # tip as of the event — not the merge base — so a stale branch is compared
+          # against a base that has moved past it; the already-released probe below
+          # catches the common accident that follows, and monotonicity is a declared
+          # non-goal otherwise. PR_HEAD is the branch's real head commit, NOT the
+          # ephemeral merge commit this run checked out: tagging the merge ref would
+          # make a throwaway commit permanently reachable.
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+
+          refuse() { echo "::error title=VERSION is not usable::$1"; exit 1; }
+
+          # stdout: the VERSION blob, or nothing when the path is absent in that commit.
+          # return 3: the commit is not in this clone.
+          #
+          # `git show <sha>:VERSION` exits 128 and writes to stderr when the path is
+          # absent in that commit:
+          #   $ git show b02de50:VERSION
+          #   fatal: path 'VERSION' does not exist in 'b02de50'
+          # Under `set -e` that would fail the job on the most ordinary case there is —
+          # no VERSION on the base branch yet — so absence is captured as the empty
+          # string, deliberately, and is not an error. Inside an `if` condition `set -e`
+          # is suspended, so cat-file's 128 is ours to interpret.
+          #
+          # But absence is the ONLY failure allowed to read as empty. A commit that is
+          # not in this clone, or a malformed sha, must not arrive at the caller looking
+          # like "no VERSION here", because empty-at-base is the branch that PUBLISHES.
+          # A plain `2>/dev/null || true` cannot tell the two apart and answers "absent"
+          # to both, which would publish a public prerelease on the strength of a git
+          # error.
+          #
+          # It returns rather than refusing, and that is not a style choice: refuse()
+          # writes a ::error:: workflow command to stdout, and stdout inside $(...) is
+          # captured into the caller's variable instead of reaching the run log — while
+          # its `exit 1` ends only the substitution subshell. Reproduced under bash, sh,
+          # dash and zsh: the step dies with `exit code 1`, no annotation and no message,
+          # on the single most confusing failure this gate has. The caller refuses, where
+          # the annotation is actually visible.
+          #
+          # $(...) strips trailing newlines, so `1.0.2\n` arrives as `1.0.2` with no
+          # trimming of our own. That is what lets check() treat a space, a tab, a CR or
+          # an interior newline as a refusal rather than silently cleaning it up.
+          read_version() {
+            git rev-parse --verify --quiet "$1^{commit}" >/dev/null || return 3
+            if git cat-file -e "$1:VERSION" 2>/dev/null; then
+              git show "$1:VERSION"
+            fi
+          }
+
+          # No `tr`, no `head`: $(...) already strips trailing newlines, and the [!0-9.]
+          # class rejects a space, a tab, a CR, an interior newline, a hyphen and a
+          # leading v. Trimming first would quietly accept "1.0.2  " and a CRLF file,
+          # which is the opposite of refusing. A trailing LF is the only whitespace
+          # tolerated, because every editor on earth writes one.
+          check() {
+            case "$1" in
+              '')        refuse "VERSION is empty." ;;
+              *[!0-9.]*) refuse "VERSION must be dotted integers only — no leading 'v', no '-rc' suffix, no spaces, no CRLF. Fix the file; this is not a warning." ;;
+              .*|*.)     refuse "VERSION has a leading or trailing dot: '$1'" ;;
+              *..*)      refuse "VERSION has an empty component: '$1'" ;;
+            esac
+          }
+
+          # No output is written on any path that does not release, so `rc` is the empty
+          # string there rather than a second 'rc=' line whose precedence is undefined.
+          if [ "$EVENT" != pull_request ]; then
+            echo "not a pull request — the release path belongs to release.yml"
+            exit 0
+          fi
+
+          # Skipped, not failed, and tested FIRST — before the file is even read. A fork
+          # run gets no certificate and no notary key by GitHub's design, so there is
+          # nothing here to publish and nothing a contributor could do about a complaint
+          # from this job.
+          if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice title=No release candidate from a fork::A fork pull request gets no signing certificate or notary key, so no release candidate can be published from it, and VERSION is not inspected here. The ad-hoc build matrix still runs and still gates the merge. VERSION is validated on main, where it blocks the release rather than the pull request."
+            exit 0
+          fi
+
+          BASE_V=$(read_version "$PR_BASE") \
+            || refuse "commit $PR_BASE is not in this clone, so VERSION cannot be read from it. That is a fetch-depth or a rewritten-history problem, not an absent file."
+          HEAD_V=$(read_version "$PR_HEAD") \
+            || refuse "commit $PR_HEAD is not in this clone, so VERSION cannot be read from it. That is a fetch-depth or a rewritten-history problem, not an absent file."
+
+          if [ -z "$HEAD_V" ]; then
+            if [ -n "$BASE_V" ]; then
+              refuse "VERSION is $BASE_V on the base branch and deleted on this one. VERSION is what drives releases; deleting it is never what anyone meant."
+            fi
+            echo "no VERSION file on either side — nothing to release"
+            exit 0
+          fi
+          check "$HEAD_V"
+
+          if [ -n "$BASE_V" ] && [ "$BASE_V" = "$HEAD_V" ]; then
+            echo "VERSION unchanged at $HEAD_V — no release candidate"
+            exit 0
+          fi
+          if [ -z "$BASE_V" ]; then
+            echo "VERSION is absent on the base branch and is $HEAD_V here"
+          else
+            echo "VERSION changed: $BASE_V -> $HEAD_V"
+          fi
+
+          # The rc namespace is not the only thing that can collide. A version that has
+          # already been RELEASED must not acquire new release candidates: a still-open
+          # branch carrying VERSION=1.0.2 after v1.0.2 shipped would otherwise keep
+          # publishing v1.0.2-rc.14, -rc.15 … as signed, notarized public prereleases of
+          # a version the tap already serves. Refuse, and say what to do about it.
+          #
+          # ^{} first, then the plain form: ^{} resolves an annotated tag to its commit
+          # and yields nothing at all for a lightweight one, so both halves are needed
+          # and this is the order that works.
+          #
+          # The remote is the whole check, on purpose. This clone's tags are a copy of
+          # origin's as of this job's own fetch and can only be staler, never fresher,
+          # so a local probe would add nothing; origin is the only place a tag means
+          # anything to anyone else, and so the only place a collision can exist.
+          RELEASED=$(git ls-remote --tags origin "refs/tags/v${HEAD_V}^{}" | awk '{print $1}' | head -1)
+          [ -n "$RELEASED" ] || RELEASED=$(git ls-remote --tags origin "refs/tags/v${HEAD_V}" | awk '{print $1}' | head -1)
+          [ -z "$RELEASED" ] || refuse "v${HEAD_V} already exists on origin at ${RELEASED} — ${HEAD_V} has already been released. Bump VERSION; a released version does not get new release candidates."
+
+          # Idempotency across RUNS, not just across re-runs of one run. run_number is
+          # stable when you press Re-run, which is what makes the computed tag below
+          # stable — but `reopened` is a default pull_request activity type and fires a
+          # NEW run, with a NEW run_number, on the SAME head commit. So is a
+          # force-push that lands back on an already-published commit. Probing only the
+          # name this run computes would miss both, and closing and reopening a pull
+          # request would publish a second public prerelease of bytes that already have
+          # one. The question is therefore not "does v<VERSION>-rc.<this run> exist" but
+          # "does ANY v<VERSION>-rc.* already point at this commit".
+          EXISTING_RC=$(git ls-remote --tags origin "refs/tags/v${HEAD_V}-rc.*" \
+            | awk -v t="$PR_HEAD" '$1 == t { sub(/\^\{\}$/, "", $2); print $2 }' | head -1)
+          if [ -n "$EXISTING_RC" ]; then
+            echo "::notice title=Release candidate already published::${EXISTING_RC#refs/tags/} already points at $PR_HEAD. Nothing to publish — this commit already has a release candidate."
+            exit 0
+          fi
+
+          TAG="v${HEAD_V}-rc.${GITHUB_RUN_NUMBER}"
+
+          # Never move a tag, never collide with one. A re-run of THIS run reuses the
+          # same run_number and therefore computes the same tag, so "the tag exists" is
+          # only an error when it points somewhere else. Pointing at our own target is
+          # the recoverable case, handled in signed-build.
+          POINTS=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}' | head -1)
+          [ -n "$POINTS" ] || POINTS=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}' | head -1)
+          if [ -n "$POINTS" ] && [ "$POINTS" != "$PR_HEAD" ]; then
+            refuse "$TAG already exists on origin pointing at $POINTS, not at this branch's head $PR_HEAD. Refusing: a tag is never moved."
+          fi
+
+          {
+            echo "rc=yes"
+            echo "tag=$TAG"                                       # with the v
+            echo "rc_version=${HEAD_V}-rc.${GITHUB_RUN_NUMBER}"   # without it
+            echo "target=$PR_HEAD"
+          } >> "$GITHUB_OUTPUT"
+
+      # Quiet by default. The common case — VERSION unchanged — writes nothing at all: a
+      # summary that says "nothing happened" on every run trains people to stop reading
+      # it. A refusal needs no summary step either, because `::error title=…::` already
+      # annotates the run and the job is red.
+      - name: Summary
+        if: steps.detect.outputs.rc == 'yes'
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+          TARGET: ${{ steps.detect.outputs.target }}
+        run: |
+          set -eu
+          # shellcheck disable=SC2016
+          {
+            printf '## Release candidate: `%s`\n\n' "$TAG"
+            printf '`VERSION` moved on this branch, so `signed-build` will publish this run'"'"'s notarized build as a **prerelease**, tagged at commit `%s`.\n\n' "$TARGET"
+            printf 'The Homebrew tap is not touched and no approval is requested — that happens only when the bump reaches `main`.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # An installable build of the branch under review.
   #
   # The matrix artifacts above cannot serve this purpose. That job has no secrets, so
@@ -115,10 +350,15 @@ jobs:
   # exists to produce that bundle: signed with the Developer ID, notarized, stapled and
   # Gatekeeper-checked, exactly as a release is.
   #
-  # It stops there. No tag, no GitHub release, no cask, no tap — a workflow artifact is
-  # its only output, and HOMEBREW_TAP_DEPLOY_KEY is deliberately never named in this
-  # file, so a pull-request run has no path to the tap at all.
+  # It stops short of the tap, and only of the tap. When VERSION moved on the branch this
+  # job also creates a lightweight tag and a GitHub *prerelease* carrying the bundle it
+  # just built — see "Publish the release candidate" below. What it still cannot do is
+  # change what `brew upgrade` gives other people: HOMEBREW_TAP_DEPLOY_KEY is deliberately
+  # never named in this file, no job here declares an `environment`, and a prerelease is
+  # excluded by Homebrew's :github_latest livecheck — so a pull-request run has no path to
+  # the tap at all, by three independent mechanisms rather than by one.
   signed-build:
+    needs: version-gate
     # macos-15 because release.yml uses macos-15, not because it is the better image —
     # macos-26 is newer and is what the author runs. A test build has to be made the
     # same way the release is or it is not the artifact that ships, and on this project
@@ -155,6 +395,13 @@ jobs:
     # AnywayConnect-installable artifact" remains the corroborating signal.
     continue-on-error: true
 
+    # Job-scoped, not workflow-scoped: the workflow default stays `contents: read`, so
+    # the secret-free matrix job keeps exactly the token it has today. Write is needed
+    # for three calls and no others — create the rc tag ref, create the rc release, and
+    # (only on a cancellation) delete a tag this same run created moments earlier.
+    permissions:
+      contents: write
+
     steps:
       # Shallow, unlike the matrix job: ANYWAY_VERSION is passed explicitly below, so
       # build-app.sh never reaches its `git describe` fallback and there are no tags to
@@ -170,16 +417,32 @@ jobs:
       # intent: verify-bundle.sh treats a short version of 0.0.0 as information rather
       # than a failure, the About panel shows the full build string in parentheses
       # because the two differ, and nothing here looks like a release.
+      #
+      # Unless version-gate found a VERSION bump, in which case this build *is* the one
+      # being published and the string becomes the real release-candidate tag,
+      # v1.0.2-rc.13. An artifact labelled 0.0.0 sitting beside a release labelled
+      # 1.0.2-rc.13 would be two names for the same bytes. The leading `v` is kept so
+      # the zip is named AnywayConnect-v1.0.2-rc.13.zip, matching both release.yml and
+      # make-cask.sh's url template; build-app.sh strips it with ${ANYWAY_VERSION#v}
+      # before deriving anything.
+      #
+      # Named build_version, not version: this one carries the leading `v` on the rc
+      # path and not otherwise, and there are two other `version`-ish outputs in this
+      # change that never carry it.
       - name: Derive the version
         id: meta
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          RC: ${{ needs.version-gate.outputs.rc }}
+          RC_TAG: ${{ needs.version-gate.outputs.tag }}
         run: |
           set -eu
-          if [ -n "${PR_NUMBER:-}" ]; then
-            echo "version=0.0.0-pr${PR_NUMBER}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          if [ "${RC:-no}" = yes ]; then
+            echo "build_version=$RC_TAG" >> "$GITHUB_OUTPUT"
+          elif [ -n "${PR_NUMBER:-}" ]; then
+            echo "build_version=0.0.0-pr${PR_NUMBER}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=0.0.0-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "build_version=0.0.0-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
 
       # Same reason as the matrix job: only needed for its vpnc-script, and without it
@@ -235,7 +498,7 @@ jobs:
 
       - name: Build
         env:
-          ANYWAY_VERSION: ${{ steps.meta.outputs.version }}
+          ANYWAY_VERSION: ${{ steps.meta.outputs.build_version }}
         run: ./build-app.sh
 
       # build-app.sh falls back to ad-hoc signing with a warning rather than an error,
@@ -248,9 +511,16 @@ jobs:
             | grep -q "^Authority=Developer ID Application" \
             || { echo "::error::build did not use a Developer ID identity"; exit 1; }
 
-      # No EXPECT_VERSION here, unlike the release: there is no tag for the bundle to
-      # agree with, and 0.0.0 is the intended short version.
+      # EXPECT_VERSION is set only when this run is publishing a release candidate.
+      # Then there IS a tag for the bundle to agree with, and the one path that
+      # publishes to the public must not be the one path that skips the check. When
+      # VERSION did not move, the job output interpolates to the empty string,
+      # verify-bundle.sh's `if [ -n "${EXPECT_VERSION:-}" ]` skips the assertion, and
+      # 0.0.0 remains the intended short version exactly as before. (This block used to
+      # say there was never a tag to agree with, which this change made false.)
       - name: Verify bundle invariants
+        env:
+          EXPECT_VERSION: ${{ needs.version-gate.outputs.tag }}
         run: sh scripts/verify-bundle.sh AnywayConnect.app
 
       # Not optional for a build meant to be installed. Signing alone gets the daemon
@@ -293,7 +563,7 @@ jobs:
       # the download still verifies.
       - name: Package
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ steps.meta.outputs.build_version }}
         run: |
           set -eu
           ZIP="AnywayConnect-${VERSION}.zip"
@@ -318,6 +588,200 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # Publishes the bundle this job already built. Not a second build: signed-build has
+      # already compiled, signed, Developer-ID-checked, version-asserted, connect-tested,
+      # notarized, stapled and Gatekeeper-checked exactly these bytes, and notarization
+      # is an external Apple service with a queue. Building again to publish would double
+      # the slowest step in the run to produce a bundle differing only in a string — and
+      # would mean the artifact a human installs is not the bundle on the release.
+      #
+      # ORDER MATTERS, because ci.yml is `cancel-in-progress: true` and a newer push to
+      # the branch kills this job wherever it happens to be:
+      #   1. the tag ref is created FIRST, at the pull request's head commit;
+      #   2. then the release is created as a DRAFT, with every asset;
+      #   3. the assets are asserted complete while it is still invisible;
+      #   4. only then is it published, in one API call.
+      # Creating the release first and the tag second was considered and rejected: `gh
+      # release create` with no existing tag and no --target creates the tag at the
+      # DEFAULT BRANCH TIP, which is the wrong commit. A cancellation between 1 and 2
+      # leaves a bare tag, which the compensating step below withdraws; a cancellation
+      # anywhere between 2 and 4 leaves only a draft, which no one can see and brew
+      # cannot reach.
+      #
+      # The tag goes through the git refs API rather than `gh release create --target`,
+      # and that is not a style choice. GitHub's "Create a release" endpoint refuses when
+      # the commit named by target_commitish adds or modifies any file under
+      # .github/workflows/ relative to the default branch, and states that the
+      # GITHUB_TOKEN available to Actions cannot be authorized for it. The pull request
+      # that introduced this file modifies both workflow files, so --target would have
+      # 404'd on its very first run. With the tag already in place, target_commitish is
+      # documented as "Unused if the Git tag already exists" and is omitted, so the
+      # endpoint's check falls back to the default branch tip — which, being the default
+      # branch, differs from itself not at all. The same reasoning covers the --draft=false
+      # edit: "Update a release" keys on the RESOLVED target, which with the tag already
+      # present is that same default branch.
+      - name: Publish the release candidate
+        if: needs.version-gate.outputs.rc == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version-gate.outputs.tag }}
+          TARGET: ${{ needs.version-gate.outputs.target }}
+          RC_VERSION: ${{ needs.version-gate.outputs.rc_version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          # Checked explicitly because the hash runs through a pipe, and a pipeline takes
+          # its status from the last command — so a failing shasum would be swallowed by
+          # tee and publish an empty .sha256. Same reasoning, same guard, as release.yml.
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+          [ -s "$ZIP.sha256" ] || { echo "::error::packaging produced no checksum"; exit 1; }
+          SHA=$(cut -d' ' -f1 "$ZIP.sha256")
+
+          # Attached for the same reason release.yml attaches it: the exact cask text a
+          # release would publish is recoverable from the release itself. Nothing consumes
+          # it here — a prerelease never reaches the tap — but it is how a human reviews
+          # what the final release will put in front of brew users, one merge before it
+          # happens.
+          sh scripts/make-cask.sh "$RC_VERSION" "$SHA" > anyway-connect.rb
+          # Checked for the same reason the checksum is: the redirect truncates before the
+          # script runs, so a failure after that point leaves a zero-byte file that would
+          # upload under the right name and satisfy the asset check below.
+          [ -s anyway-connect.rb ] || { echo "::error::make-cask.sh produced no cask"; exit 1; }
+
+          # Idempotency. A re-run of this same run recomputes the same tag, because
+          # run_number does not change on a re-run — so "already published" means done,
+          # not failed. Note `gh release view` succeeds for a DRAFT too, which is why this
+          # branches on isDraft rather than on mere existence: a draft left by a cancelled
+          # earlier attempt has to be completed, not reported as published.
+          STATE=$(gh release view "$TAG" --json isDraft \
+                    --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null || echo none)
+          case "$STATE" in
+            published)
+              echo "::notice::$TAG is already published — this is a re-run; nothing to do"
+              {
+                echo "RC_STATE=already-published"
+                echo "RC_URL=$(gh release view "$TAG" --json url --jq .url)"
+              } >> "$GITHUB_ENV"
+              exit 0 ;;
+            draft)
+              echo "$TAG exists as an unpublished draft from an earlier attempt; completing it" ;;
+          esac
+
+          # POST creates and never updates — an existing ref comes back 422, and ref
+          # UPDATES need PATCH, which is never issued here — so the read below is what
+          # distinguishes "an earlier attempt got this far" from "somebody else's tag",
+          # rather than a --force that does not exist in this file.
+          EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)
+          if [ -z "$EXISTING" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$TAG" -f "sha=$TARGET" --jq .ref
+          elif [ "$EXISTING" != "$TARGET" ]; then
+            echo "::error title=Refusing to move a tag::$TAG points at $EXISTING, not at $TARGET"
+            exit 1
+          else
+            echo "$TAG already exists at $TARGET — an earlier attempt got this far; continuing"
+          fi
+
+          # Both shas are recorded, because they are different commits and only one of
+          # them is the one the published bytes came from.
+          cat > "$RUNNER_TEMP/rc-notes.md" <<NOTES
+          Built from pull request #${PR_NUMBER}, run ${GITHUB_RUN_NUMBER}.
+
+          Tag points at branch head \`${TARGET}\`; the bundle was built from merge commit \`${GITHUB_SHA}\`.
+
+          > [!NOTE]
+          > This is a **release candidate**. It is Developer ID signed, notarized and
+          > stapled, so it installs and runs exactly as a release does — but it is a
+          > prerelease, it is **not** in the Homebrew tap, and \`brew upgrade\` will
+          > never offer it. The tap is updated only from a final \`v*\` tag on
+          > \`main\`, behind a manual approval.
+          >
+          > The bundle was built from this branch merged into its base — merge commit
+          > \`${GITHUB_SHA}\`, which is what will land. That commit is ephemeral
+          > (\`refs/pull/N/merge\` is recreated on every push) and is recorded here
+          > because it is the only name the published bytes have. The tag points at the
+          > branch head instead, because that is the commit a human can check out.
+          NOTES
+
+          # --verify-tag so a failure to create the tag above can never be papered over by
+          # gh silently creating a lightweight one at the default branch tip. No --target,
+          # for the reason in the header comment. --draft so nothing is visible until the
+          # assets have been checked.
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" anyway-connect.rb \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/rc-notes.md" \
+            --prerelease \
+            --draft \
+            --verify-tag
+
+          # The asset-upload window, closed on both sides. gh uploads after creating, so
+          # a failure or a cancellation partway through would otherwise leave a public
+          # prerelease missing its checksum — a release nobody can verify, with nothing to
+          # detect it. Asserted here while the release is still a draft and therefore
+          # invisible.
+          NAMES=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for a in "$ZIP" "$ZIP.sha256" anyway-connect.rb; do
+            printf '%s\n' "$NAMES" | grep -qxF "$a" \
+              || { echo "::error::$a is missing from $TAG"; exit 1; }
+          done
+
+          # One API call, and the only one that makes anything public.
+          gh release edit "$TAG" --draft=false
+
+          {
+            echo "RC_STATE=published"
+            echo "RC_SHA256=$SHA"
+            echo "RC_URL=$(gh release view "$TAG" --json url --jq .url)"
+          } >> "$GITHUB_ENV"
+
+      # cancel-in-progress: true kills this job wherever it is, including in the gap
+      # between creating the tag ref and creating the release — which would leave a bare
+      # tag that claims a release candidate exists when none does. Tags are invisible to
+      # brew (Homebrew's :github_latest livecheck reads releases, and brew has no view of
+      # a repository's tags at all), so the harm is cosmetic rather than dangerous; but a
+      # tag with no release is still a lie about what was published.
+      #
+      # The blast radius is deliberately tiny. It deletes:
+      #   - only a TAG, never a release — there is no release-deleting call anywhere in
+      #     this file, so it cannot delete the wrong release because it cannot delete any;
+      #   - only the tag THIS run computed, whose name contains this run's own run_number;
+      #   - only when that tag points at this run's own target commit;
+      #   - only when no release, not even a draft, is attached to it.
+      # A tag another run made cannot satisfy the third condition, and a completed publish
+      # cannot satisfy the fourth.
+      #
+      # Deliberately NOT gated on a "this run created the tag" flag. Such a flag would
+      # have to come out of $GITHUB_ENV written by the very step a cancellation kills, and
+      # whether a force-terminated step's env file is processed at all is undocumented —
+      # so the guard would be inert in exactly the window it exists for. The three
+      # conditions above need no such flag.
+      #
+      # Best-effort, and honestly so: a cancelled job gets a short grace window, so if the
+      # cancellation lands inside this step the tag survives. That residue is self-healing
+      # — a re-run of the same run recomputes the identical tag, finds it at the same
+      # commit, and completes the release on top.
+      - name: Withdraw a half-created release candidate
+        if: cancelled() && needs.version-gate.outputs.rc == 'yes'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version-gate.outputs.tag }}
+          TARGET: ${{ needs.version-gate.outputs.target }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG has a release or a draft; leaving it alone"
+            exit 0
+          fi
+          AT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)
+          if [ "$AT" != "$TARGET" ]; then
+            echo "$TAG is absent or does not point at $TARGET; leaving it alone"
+            exit 0
+          fi
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG"
+          echo "::notice title=Release candidate withdrawn::$TAG was created but this run was cancelled before the release existed, so the tag was deleted again. Nothing was published."
+          echo "RC_STATE=withdrawn" >> "$GITHUB_ENV"
+
       # Not optional. Runs even when something above failed, so a failed run cannot
       # leave a private key sitting on a shared runner image.
       - name: Remove the keychain
@@ -335,6 +799,9 @@ jobs:
       # would reveal it was wrong.
       - name: Run summary (failed)
         if: failure()
+        env:
+          RC: ${{ needs.version-gate.outputs.rc }}
+          RC_TAG: ${{ needs.version-gate.outputs.tag }}
         run: |
           set -eu
           # Single-quoted Markdown format strings, whose backticks are code spans rather
@@ -344,7 +811,11 @@ jobs:
           {
             printf '## :rotating_light: `signed-build` FAILED — the rest of this run is telling you otherwise\n\n'
             printf 'This job carries `continue-on-error: true`, so the run conclusion, the commit status and the PR checks summary all report **success**. Nothing else on this page will say what you are reading here.\n\n'
-            printf -- '- There is **no installable build** of this branch. `AnywayConnect-macos-15` and `AnywayConnect-macos-26` are ad-hoc signed: they will not launch on another machine and cannot register the privileged daemon.\n\n'
+            printf -- '- There is **no installable build** of this branch. `AnywayConnect-macos-15` and `AnywayConnect-macos-26` are ad-hoc signed: they will not launch on another machine and cannot register the privileged daemon.\n'
+            if [ "${RC:-no}" = yes ]; then
+              printf -- '- The release candidate `%s` was **not** published, or was published incompletely. Read the step log before assuming either.\n' "$RC_TAG"
+            fi
+            printf '\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # if: success() is what a step does by default; it is spelled out because its
@@ -360,4 +831,35 @@ jobs:
           {
             printf '### Installable build\n\n'
             printf -- '- **`AnywayConnect-installable`** — `AnywayConnect-%s.zip`. The **only** artifact on this run that will launch on a machine other than the runner, and the only one that can register the privileged daemon: Developer ID signed, notarized, stapled. The two `AnywayConnect-macos-*` artifacts are ad-hoc signed and will do neither.\n\n' "$VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Always, including on a cancellation: "an rc was expected and is not there" is
+      # exactly what a cancelled publish leaves behind, and it is worth saying. RC_STATE,
+      # RC_URL and RC_SHA256 come from $GITHUB_ENV written by the publish step (or by the
+      # withdrawal step), and are read with `:-` defaults so this is correct whether that
+      # step ran, skipped, was cancelled or died.
+      - name: Run summary (release candidate)
+        if: always()
+        env:
+          RC: ${{ needs.version-gate.outputs.rc }}
+          RC_TAG: ${{ needs.version-gate.outputs.tag }}
+        run: |
+          set -eu
+          # shellcheck disable=SC2016
+          {
+            printf '### Release candidate\n\n'
+            case "${RC:-no}:${RC_STATE:-none}" in
+              no:*)
+                printf 'None — `VERSION` did not change on this branch. This is the ordinary outcome and nothing was published.\n' ;;
+              yes:published)
+                printf -- '- **`%s`** — %s\n' "$RC_TAG" "${RC_URL:-}"
+                printf -- '- zip sha256 `%s`\n' "${RC_SHA256:-unknown}"
+                printf -- '- **Homebrew tap: not touched.** A prerelease is excluded by design, no approval was requested, and `HOMEBREW_TAP_DEPLOY_KEY` is not named anywhere in this workflow.\n' ;;
+              yes:already-published)
+                printf -- '- **`%s`** — %s\n- Already existed at this commit; this was a re-run and nothing was created twice.\n' "$RC_TAG" "${RC_URL:-}" ;;
+              yes:withdrawn)
+                printf -- '- `%s` was withdrawn: this run was cancelled between creating the tag and creating the release, and the tag was deleted again. Nothing was published.\n' "$RC_TAG" ;;
+              *)
+                printf ':rotating_light: `%s` was expected but was not published. See the step log.\n' "$RC_TAG" ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"

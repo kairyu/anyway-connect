@@ -111,9 +111,20 @@ brew install xmlstarlet          # for gateways needing the CSD/posture step
 open AnywayConnect.app
 ```
 
-Paths are auto-detected, and configurable in Settings if yours differ. The
-version comes from the git tag, so a build off a tag reports that version and a
-build in between says so.
+Paths are auto-detected, and configurable in Settings if yours differ.
+
+The repository root carries a `VERSION` file holding the **next intended
+release** — dotted integers, nothing else — and the workflows pass it to
+`build-app.sh` as `ANYWAY_VERSION`. A plain local `./build-app.sh` does not read
+it: it derives its version from `git describe`, which says where your working
+tree sits relative to the last tag that actually shipped. That is deliberately
+not the same thing as `VERSION`, because a development build at an arbitrary
+commit claiming to be `1.0.2` would be advertising a version that does not exist
+yet. To build locally with the version a release would carry:
+
+```
+ANYWAY_VERSION="v$(cat VERSION)" ./build-app.sh
+```
 
 The build stages into `AnywayConnect.app.staging` and swaps it over the real
 bundle only once signing and verification pass, so a build that dies partway
@@ -145,9 +156,24 @@ notarize one by hand:
 sh scripts/notarize.sh AnywayConnect.app
 ```
 
-CI builds and tests on every push, unsigned, needing no secrets. Tagging `v*`
-produces a signed, notarized release and updates the tap — see
-[docs/FEATURES.md](docs/FEATURES.md#ci-and-releases) for the secrets that needs.
+CI's build matrix needs **no secrets**, which is what lets it run on forks, and
+it is the job that gates a merge. A second job does need the certificate, and
+produces the one artifact that will launch on another machine.
+
+Shipping is four beats, and pushing a tag is not one of them:
+
+1. **Edit `VERSION`** to the version you intend to release.
+2. **Open a pull request.** Its run publishes a notarized
+   `v<VERSION>-rc.<run>` prerelease you can install and test. The Homebrew tap
+   is untouched and nobody is asked to approve anything.
+3. **Merge.** That is what creates the annotated `v<VERSION>` tag and the real
+   release.
+4. **Approve the tap push.** Nothing reaches `kairyu/homebrew-tap` until you do.
+
+Leaving `VERSION` alone releases nothing, which is the ordinary case. A
+hand-pushed `v*` tag still works as an escape hatch. See
+[docs/FEATURES.md](docs/FEATURES.md#ci-and-releases) for the secrets all of that
+needs.
 
 ## When the network goes unusable
 

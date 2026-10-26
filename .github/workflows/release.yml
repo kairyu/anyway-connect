@@ -660,6 +660,18 @@ jobs:
       - name: Update the Homebrew tap
         env:
           GH_TOKEN: ${{ github.token }}
+          # Required, not decorative. This job deliberately has no actions/checkout — it
+          # needs nothing from this repository's tree, only one asset from the release —
+          # so there is no git repository for `gh` to infer the target repo from, and the
+          # very first `gh` call dies with the distinctly unhelpful
+          #
+          #     failed to run git: fatal: not a git repository
+          #
+          # That is exactly how the v1.0.1 tap push failed on its first ever execution:
+          # the release was built, notarized, published and approved, and this job then
+          # fell over before its first useful command. GH_REPO states the repository
+          # explicitly, which is the supported way to run `gh` outside a checkout.
+          GH_REPO: ${{ github.repository }}
           TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_REPO: kairyu/homebrew-tap
           VERSION: ${{ needs.release.outputs.version }}

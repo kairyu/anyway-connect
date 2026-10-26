@@ -1,0 +1,4 @@
+-n delete -host 100.64.5.10
+-n delete -host 100.64.5.10 -ifscope en0
+-n delete -host 100.64.5.11
+-n delete -host 100.64.5.11 -ifscope en8

@@ -1,0 +1,138 @@
+onLinkRoute 10.0.1.0/24
+onLinkRoute 10.0.1.0/24
+onLinkRoute 10.0.1.1/32
+onLinkRoute 10.0.1.22/32
+gatewayOnLink 10.0.1.51 via 10.0.1.1
+gatewayInLiveSubnet 10.0.1.77 via 10.0.1.22 why gatewayIsOwnAddress
+gatewayOnLink 100.64.0.0/16 via 10.0.1.1
+gatewayOnLink 100.65.0.0/16 via 10.0.1.1
+gatewayOnLink 100.66.0.0/16 via 10.0.1.1
+gatewayOnLink 100.67.0.0/16 via 10.0.1.1
+gatewayOnLink 100.68.0.0/16 via 10.0.1.1
+gatewayOnLink 100.69.0.0/17 via 10.0.1.1
+gatewayOnLink 100.69.128.0/17 via 10.0.1.1
+gatewayOnLink 100.70.0.0/17 via 10.0.1.1
+gatewayOnLink 100.70.128.0/18 via 10.0.1.1
+gatewayOnLink 100.70.192.0/18 via 10.0.1.1
+gatewayOnLink 100.71.0.0/19 via 10.0.1.1
+gatewayOnLink 100.71.32.0/19 via 10.0.1.1
+gatewayOnLink 100.71.64.0/18 via 10.0.1.1
+tunnelOnLinkGateway 100.71.128.0/18 via 192.168.204.16
+gatewayOnLink 100.71.192.0/19 via 10.0.1.1
+gatewayOnLink 100.71.224.0/20 via 10.0.1.1
+gatewayOnLink 100.71.240.0/21 via 10.0.1.1
+gatewayOnLink 100.71.248.0/22 via 10.0.1.1
+gatewayOnLink 100.71.252.0/22 via 10.0.1.1
+gatewayOnLink 100.72.0.1/32 via 10.0.1.1
+gatewayOnLink 100.72.0.2/32 via 10.0.1.1
+gatewayOnLink 100.72.0.3/32 via 10.0.1.1
+gatewayOnLink 100.72.0.4 via 10.0.1.1
+gatewayOnLink 100.72.0.5/32 via 10.0.1.1
+gatewayOnLink 100.72.0.5/32 via 10.0.1.1
+gatewayOnLink 100.72.0.6/32 via 10.0.1.1
+gatewayOnLink 100.72.0.7/32 via 10.0.1.1
+gatewayOnLink 100.72.0.8/32 via 10.0.1.1
+gatewayOnLink 100.72.0.9/32 via 10.0.1.1
+gatewayOnLink 100.72.0.10/32 via 10.0.1.1
+gatewayOnLink 100.72.0.10/32 via 10.0.1.1
+gatewayOnLink 100.72.0.11/32 via 10.0.1.1
+gatewayOnLink 100.72.0.11/32 via 10.0.1.1
+gatewayOnLink 100.72.0.12/32 via 10.0.1.1
+gatewayOnLink 100.72.0.12/32 via 10.0.1.1
+gatewayOnLink 100.72.0.13/32 via 10.0.1.1
+gatewayOnLink 100.72.0.13/32 via 10.0.1.1
+gatewayOnLink 100.72.0.14/32 via 10.0.1.1
+gatewayOnLink 100.72.0.15/32 via 10.0.1.1
+gatewayOnLink 100.72.0.16/28 via 10.0.1.1
+gatewayOnLink 100.72.0.32/27 via 10.0.1.1
+gatewayOnLink 100.72.0.64/26 via 10.0.1.1
+gatewayOnLink 100.72.0.128/25 via 10.0.1.1
+gatewayOnLink 100.72.1.0/24 via 10.0.1.1
+gatewayOnLink 100.72.2.0/23 via 10.0.1.1
+gatewayOnLink 100.72.4.0/22 via 10.0.1.1
+gatewayOnLink 100.72.8.0/22 via 10.0.1.1
+gatewayOnLink 100.72.12.0/22 via 10.0.1.1
+gatewayOnLink 100.72.16.0/22 via 10.0.1.1
+gatewayOnLink 100.72.20.0/23 via 10.0.1.1
+gatewayOnLink 100.72.22.0/23 via 10.0.1.1
+gatewayOnLink 100.72.24.0/23 via 10.0.1.1
+gatewayOnLink 100.72.26.0/23 via 10.0.1.1
+gatewayOnLink 100.72.28.0/23 via 10.0.1.1
+gatewayOnLink 100.72.30.0/23 via 10.0.1.1
+gatewayOnLink 100.72.32.0/24 via 10.0.1.1
+gatewayOnLink 100.72.33.0/24 via 10.0.1.1
+gatewayOnLink 100.72.34.0/24 via 10.0.1.1
+gatewayOnLink 100.72.35.0/24 via 10.0.1.1
+gatewayOnLink 100.72.36.0/24 via 10.0.1.1
+gatewayOnLink 100.72.37.0/24 via 10.0.1.1
+gatewayOnLink 100.72.38.0/24 via 10.0.1.1
+gatewayOnLink 100.72.39.0/24 via 10.0.1.1
+gatewayOnLink 100.72.40.0/24 via 10.0.1.1
+gatewayOnLink 100.72.41.0/24 via 10.0.1.1
+gatewayOnLink 100.72.42.0/24 via 10.0.1.1
+gatewayOnLink 100.72.43.0/24 via 10.0.1.1
+gatewayOnLink 100.72.44.0/24 via 10.0.1.1
+gatewayOnLink 100.72.45.0/24 via 10.0.1.1
+gatewayOnLink 100.72.46.0/24 via 10.0.1.1
+gatewayOnLink 100.72.47.0/24 via 10.0.1.1
+gatewayOnLink 100.72.48.0/24 via 10.0.1.1
+gatewayOnLink 100.72.49.0/24 via 10.0.1.1
+gatewayOnLink 100.72.50.0/24 via 10.0.1.1
+gatewayOnLink 100.72.51.0/25 via 10.0.1.1
+gatewayOnLink 100.72.51.128/25 via 10.0.1.1
+gatewayOnLink 100.72.52.0/25 via 10.0.1.1
+gatewayOnLink 100.72.52.128/25 via 10.0.1.1
+gatewayOnLink 100.72.53.0/25 via 10.0.1.1
+gatewayOnLink 100.72.53.128/25 via 10.0.1.1
+gatewayOnLink 100.72.54.0/25 via 10.0.1.1
+gatewayOnLink 100.72.54.128/25 via 10.0.1.1
+gatewayOnLink 100.72.55.0/25 via 10.0.1.1
+gatewayOnLink 100.72.55.128/25 via 10.0.1.1
+gatewayOnLink 100.72.56.0/25 via 10.0.1.1
+gatewayOnLink 100.72.56.128/25 via 10.0.1.1
+gatewayOnLink 100.72.57.0/25 via 10.0.1.1
+gatewayOnLink 100.72.57.128/25 via 10.0.1.1
+gatewayOnLink 100.72.58.0/25 via 10.0.1.1
+gatewayOnLink 100.72.58.128/25 via 10.0.1.1
+gatewayOnLink 100.72.59.0/25 via 10.0.1.1
+gatewayOnLink 100.72.59.128/25 via 10.0.1.1
+gatewayOnLink 100.72.60.0/25 via 10.0.1.1
+gatewayOnLink 100.72.60.128/25 via 10.0.1.1
+gatewayOnLink 100.72.61.0/25 via 10.0.1.1
+gatewayOnLink 100.72.61.128/25 via 10.0.1.1
+gatewayOnLink 100.72.62.0/26 via 10.0.1.1
+gatewayOnLink 100.72.62.64/26 via 10.0.1.1
+gatewayOnLink 100.72.62.128/25 via 10.0.1.1
+gatewayOnLink 100.72.63.0/26 via 10.0.1.1
+gatewayOnLink 100.72.63.64/26 via 10.0.1.1
+gatewayOnLink 100.72.63.128/25 via 10.0.1.1
+gatewayOnLink 100.72.64.0/27 via 10.0.1.1
+gatewayOnLink 100.72.64.32/27 via 10.0.1.1
+gatewayOnLink 100.72.64.64/26 via 10.0.1.1
+gatewayOnLink 100.72.64.128/25 via 10.0.1.1
+gatewayOnLink 100.72.65.1/32 via 10.0.1.1
+gatewayOnLink 100.72.65.2/32 via 10.0.1.1
+gatewayOnLink 100.72.65.3/32 via 10.0.1.1
+gatewayOnLink 100.72.65.4/32 via 10.0.1.1
+gatewayOnLink 100.72.65.5/32 via 10.0.1.1
+gatewayOnLink 100.72.65.6/32 via 10.0.1.1
+gatewayOnLink 100.72.65.16/28 via 10.0.1.1
+gatewayOnLink 100.72.65.32/27 via 10.0.1.1
+gatewayOnLink 100.72.65.64/26 via 10.0.1.1
+gatewayOnLink 100.72.65.128/25 via 10.0.1.1
+gatewayOnLink 100.72.66.32/27 via 10.0.1.1
+gatewayOnLink 100.72.66.64/26 via 10.0.1.1
+gatewayOnLink 100.72.66.128/26 via 10.0.1.1
+gatewayOnLink 100.72.66.192/27 via 10.0.1.1
+loopback 127.0.0.0/8
+loopback 127.0.0.1
+onLinkRoute 169.254.0.0/16
+onLinkRoute 169.254.64.139
+onLinkRoute 169.254.169.254
+tunnelOnLinkGateway 192.168.204.16 via 192.168.204.16
+onLinkRoute 192.168.204.16/32
+onLinkRoute 224.0.0.0/4
+onLinkRoute 224.0.0.0/4
+onLinkRoute 224.0.0.251
+onLinkRoute 255.255.255.255/32
+onLinkRoute 255.255.255.255/32

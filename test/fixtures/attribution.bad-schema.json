@@ -1,0 +1,9 @@
+{
+  "schema": 2,
+  "startedAt": "2025-10-20T09:15:00Z",
+  "sessionToken": "6F9A1C2E-3B4D-4E5F-8A7B-0C1D2E3F4A5B",
+  "tunnelPID": 4242,
+  "ourTunnel": "utun7",
+  "ourTunnelIPv4": "192.168.204.16",
+  "ourTunnelObservedAt": "2025-10-20T09:15:04Z"
+}

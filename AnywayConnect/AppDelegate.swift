@@ -1,10 +1,32 @@
 import AppKit
 import Foundation
 
+/// One thing a power or path event decided to do. Ordered, so `[forceTeardown, reconcile]`
+/// means exactly that.
+enum NetStep: Equatable {
+    case forceTeardown                  // treat the tunnel as dead; never try to repair it
+    case reconcile
+    case redial(key: String)
+    case notify(String)
+}
+
+/// Everything such an event decides, AS DATA.
+///
+/// The flags live in here rather than being assigned inside the handlers because a harness
+/// has to assert them (AC-17) and cannot construct an `AppDelegate`: `busy`'s `didSet`
+/// reaches `VPNRunner.shared`, whose initialiser runs a real privileged reconcile.
+struct PowerPlan: Equatable {
+    var steps: [NetStep] = []
+    var suppressDisconnectEdge = false      // FR-3.8
+    var rememberKey: String? = nil          // the key to pin into lastEndpointKey
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var state: VPNState = .disconnected
-    var busy = false
+    /// Mirrored into VPNRunner so the path queue can read it safely. A `didSet` rather
+    /// than edits at the eight assignment sites, and it never fires during `init`.
+    var busy = false { didSet { VPNRunner.shared.setBusy(busy) } }
     var pollTimer: Timer?
     var settingsWC: SettingsWindowController?
 
@@ -16,6 +38,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var reconnectAttempts = 0
     var userInitiatedDisconnect = false
     private var busyWatchdog: Timer?
+
+    // MARK: - Power and path state (F3)
+
+    private var powerObservers: [NSObjectProtocol] = []
+
+    /// "A `.connected` -> `.disconnected` edge seen BEFORE this instant was ours."
+    ///
+    /// NOT sleep-specific: a teardown is planned by the wake path AND by the path-change
+    /// path, so a sleep-only name invited the bug this replaces — the flag set on a Wi-Fi
+    /// hop and never cleared, silently disabling auto-reconnect for the rest of the
+    /// session.
+    ///
+    /// A DEADLINE rather than a Bool, with two rules, each fixing a different way the 8s
+    /// `refresh()` poll beats a teardown that is not instantaneous (`boundedTeardown`
+    /// allows 5s, the daemon's graceful stop up to 10s, `teardownNow()` through the step
+    /// executor is unbounded):
+    ///
+    ///   1. CONSUMED ON THE EDGE, and otherwise only once expired. A Bool consumed on
+    ///      every tick is eaten by whichever tick lands first — that tick sees
+    ///      .connected -> .connected, clears it, and the REAL edge on the next tick posts
+    ///      "Dropped — reconnecting (1/N)…" and burns a retry on a disconnect we caused.
+    ///   2. SLEEP ARMS `.distantFuture`; WAKE OVERWRITES UNCONDITIONALLY. Sleep has no
+    ///      predictable duration and nothing of ours runs while it lasts, so any finite
+    ///      deadline armed in `handleWillSleep` is already expired on wake — while the
+    ///      poll timer's fire date passed during sleep, so it fires immediately and races
+    ///      `handleDidWake`. `.distantFuture` cannot expire during sleep, and the
+    ///      unconditional overwrite at wake is what bounds it, so a suppression can never
+    ///      outlive one sleep/wake cycle and latch auto-reconnect off.
+    var suppressDisconnectEdgeUntil: Date? = nil
+
+    /// Pure, so both branches are assertable without a running app.
+    static func shouldSuppress(edge: Bool, deadline: Date?, now: Date) -> Bool {
+        edge && (deadline.map { now < $0 } ?? false)
+    }
+
+    /// Serial, and non-reentrant by try-lock. One queue so two sequences cannot
+    /// interleave; the try-lock so a SECOND event is dropped with a logged reason rather
+    /// than queued behind a 90s reconcile and executed against a world that has moved on.
+    private let stepQueue = DispatchQueue(label: "me.kairyu.anywayconnect.steps",
+                                          qos: .userInitiated)
+    /// A semaphore, not an NSLock: the refusal has to happen on the NOTIFICATION thread
+    /// (dropping the second event is the point — a queue hop would queue it instead)
+    /// while the release happens on `stepQueue`, and NSLock forbids exactly that pairing.
+    /// `wait(timeout: .now())` is the try-lock, and a cross-thread `signal()` is allowed.
+    private let stepsRunning = DispatchSemaphore(value: 1)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -60,6 +127,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         schedulePlacementCheck(in: 6, attempt: 1)
         pollTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in self?.refresh() }
 
+        // F3. Sleep/wake and interface changes are what the 8s poll above cannot see: it
+        // only ever asks "is openconnect alive", which stays true with every route
+        // pointing at a gateway two networks away.
+        let nc = NSWorkspace.shared.notificationCenter
+        powerObservers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification,
+                                             object: nil, queue: .main) { [weak self] _ in
+            self?.handleWillSleep()
+        })
+        powerObservers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification,
+                                             object: nil, queue: .main) { [weak self] _ in
+            self?.handleDidWake()
+        })
+        // Seed the mirror: `busy`'s didSet does not fire for its initial value, and the
+        // launch reconcile consults it.
+        VPNRunner.shared.setBusy(busy)
+        // Invoked on VPNRunner's path queue, so the hop to main is ours to make.
+        VPNRunner.shared.onNetworkChange = { [weak self] primary in
+            DispatchQueue.main.async { self?.handleNetworkChange(primary) }
+        }
+        // Started here rather than in VPNRunner.init: the handler calls back into this
+        // object, so the app must be past launch before an update can arrive.
+        VPNRunner.shared.startPathMonitor()
+
         // A second launch hands off to us rather than starting a rival instance.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showSettingsOnRelaunch),
@@ -76,6 +166,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, andSelector: #selector(handleReopenEvent(_:withReply:)),
             forEventClass: AEEventClass(kCoreEventClass),
             andEventID: AEEventID(kAEReopenApplication))
+    }
+
+    /// New: there was no `applicationWillTerminate` before F3.
+    ///
+    /// NSWorkspace's notification centre holds its observers without owning them, and the
+    /// path monitor keeps a queue and a handler alive, so quitting without this leaves
+    /// both running against an object that is on its way out.
+    func applicationWillTerminate(_ notification: Notification) {
+        let nc = NSWorkspace.shared.notificationCenter
+        for o in powerObservers { nc.removeObserver(o) }
+        powerObservers.removeAll()
+        VPNRunner.shared.stopPathMonitor()
     }
 
     /// Guards against stacking one alert per impatient double-click.
@@ -314,9 +416,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Icons
 
-    enum IconState { case disconnected, connecting, connected }
+    /// Four states, not three: `busy` covers a connect AND a disconnect, and a caller
+    /// that collapses them has to show one of the two a badge that names the other.
+    /// `connectingKey` is what tells them apart — see its declaration.
+    enum IconState { case disconnected, connecting, disconnecting, connected }
     func stateForIcon() -> IconState {
-        if busy { return .connecting }
+        if busy { return connectingKey != nil ? .connecting : .disconnecting }
         if case .connected = state { return .connected }
         return .disconnected
     }
@@ -426,6 +531,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .connecting:   return globeIcon(badge: .symbol("ellipsis.circle.fill"),
                                              describing: "Connecting")
         case .connected:    return globeIcon(badge: .lock, describing: "Connected")
+        // No fourth badge, deliberately. A disconnect keeps whatever appearance the
+        // connection already had, because for as long as the teardown runs THE TUNNEL
+        // IS STILL UP — `state` is still `.connected` until the poll after it lands,
+        // and traffic is still going through it. The connecting ellipsis said the
+        // opposite of the truth here: "not protected yet, wait", when the user is in
+        // fact still protected and about to stop being. Inventing a third badge would
+        // buy a distinction the menu already draws in words ("Working…") at the cost
+        // of a glyph nobody has learnt, and would have to be told apart from the
+        // ellipsis at 12pt in the corner of a 19pt globe.
+        //
+        // Derived from `state` rather than hardcoded to the lock, so the one path that
+        // can reach here with the tunnel already gone shows "disconnected" instead of
+        // claiming a lock that no longer holds.
+        case .disconnecting:
+            if case .connected = state { return globeIcon(badge: .lock, describing: "Disconnecting") }
+            return globeIcon(badge: .none, describing: "Disconnecting")
         }
     }
 
@@ -535,11 +656,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func refresh() {
         let newState = VPNRunner.shared.currentState()
-        if case .connected = state, case .disconnected = newState, !busy, !userInitiatedDisconnect {
+        var edge = false
+        if case .connected = state, case .disconnected = newState { edge = true }
+        // FR-3.8: a disconnect WE planned must not look like a drop. Computed before the
+        // consumption below, since that clears the deadline this reads.
+        let suppressed = Self.shouldSuppress(edge: edge, deadline: suppressDisconnectEdgeUntil,
+                                             now: Date())
+        // Consumed on the edge; otherwise only once it has expired, so a tick landing
+        // inside the teardown window leaves a live deadline alone.
+        if edge || (suppressDisconnectEdgeUntil.map { $0 <= Date() } ?? false) {
+            suppressDisconnectEdgeUntil = nil
+        }
+        if edge, !busy, !userInitiatedDisconnect, !suppressed {
             handleUnexpectedDisconnect()
         }
         state = newState
-        if case let .connected(key, _) = newState { lastEndpointKey = key; reconnectAttempts = 0 }
+        if case let .connected(key, _) = newState {
+            lastEndpointKey = key
+            reconnectAttempts = 0
+            // Cleared here as well as above so the suppression is bounded even if the
+            // wake handler never runs: being connected again means whatever edge the
+            // deadline was armed for is over and done with.
+            suppressDisconnectEdgeUntil = nil
+        }
         updateButton(); rebuildMenu()
     }
 
@@ -552,6 +691,245 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(ar.retryDelaySeconds)) { [weak self] in
             self?.startConnect(key)
         }
+    }
+
+    // MARK: - Sleep, wake and network change (F3)
+    //
+    // Each handler is "decide a plan, apply its flags on the main thread, then execute
+    // its steps in order". That shape is what makes "reconcile BEFORE any re-dial" and
+    // "at most one re-dial" assertions about a value; the executor below is what makes
+    // them true in time as well.
+
+    /// The honest outcome when nobody can be asked to sign in. Named rather than inlined
+    /// so the deciders and their assertions cannot drift apart.
+    static let redialUnavailableNotice = "VPN dropped — open AnywayConnect to sign in"
+
+    /// Every decider takes the transport, which pulls FR-2.10c's reasoning into the pure
+    /// layer: on `.interactiveSudo` a teardown would be a `sudo kill -INT` *without* `-n`
+    /// and a reconcile a password prompt nobody is there to answer. All three therefore
+    /// return an empty plan, which is exactly today's behaviour on such a machine.
+    static func decideWillSleep(state: VPNState, busy: Bool,
+                                transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
+        guard transport != .interactiveSudo else { return PowerPlan() }
+        // Not while a connect is in flight: its own teardown/restore sequence is already
+        // mid-flight and racing it would leave the routing half-written.
+        guard !busy, case let .connected(key, _) = state else { return PowerPlan() }
+        // Tearing down WHILE THE OLD NETWORK IS STILL PRESENT is the whole point: it is
+        // what lets vpnc-script's own `reason=disconnect` run against the gateway the
+        // routes were built for (FR-3.7).
+        return PowerPlan(steps: [.forceTeardown], suppressDisconnectEdge: true,
+                         rememberKey: key)
+    }
+
+    static func decideDidWake(state: VPNState, busy: Bool, rememberedKey: String?,
+                              autoReconnectEnabled: Bool,
+                              transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
+        guard transport != .interactiveSudo else { return PowerPlan() }
+        guard !busy else { return PowerPlan() }      // a connect is in flight; do not fight it
+        var plan = PowerPlan()
+        if case let .connected(key, _) = state {
+            // Teardown FIRST when the process is still alive: reconcile gates itself off
+            // on a live pid (FR-2.2), so emitting it first here would be a guaranteed
+            // no-op and the stale routing would survive the wake.
+            plan.steps = [.forceTeardown, .reconcile]
+            plan.suppressDisconnectEdge = true
+            plan.rememberKey = key
+            // A teardown really did just happen, so FR-3.10's notification is the
+            // honest answer when nobody can be asked to sign in.
+            plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
+                                              autoReconnectEnabled: autoReconnectEnabled,
+                                              notifyWhenUnavailable: true)
+        } else {
+            plan.steps = [.reconcile]
+            // NO NOTIFICATION ON THIS BRANCH. Nothing dropped: the app was already
+            // disconnected before the sleep, and `lastEndpointKey` does not persist
+            // across launches, so the suffix used to deliver "VPN dropped — open
+            // AnywayConnect to sign in" on every wake of a machine that had never
+            // connected. That is the noise FR-3.10 is not about.
+            //
+            // The RE-DIAL stays, which is the one place this decider deliberately
+            // diverges from decideNetworkChange, and the divergence is not an
+            // oversight to be tidied away: a wake follows a SLEEP, and a sleep may
+            // have torn a tunnel down — handleWillSleep's own boundedTeardown does
+            // exactly that, and the 8s `refresh()` poll races handleDidWake on the
+            // way out of sleep (see `suppressDisconnectEdgeUntil`), so a tunnel this
+            // app tore down at sleep can perfectly well be reported `.disconnected`
+            // by the time we get here. Dropping the re-dial would mean a laptop
+            // carried home asleep comes back with no tunnel and no attempt to get one
+            // — symptom 1 of the reported incident. A Wi-Fi hop while already
+            // disconnected, by contrast, tore nothing down, so there is nothing there
+            // to re-dial for.
+            plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
+                                              autoReconnectEnabled: autoReconnectEnabled,
+                                              notifyWhenUnavailable: false)
+        }
+        return plan
+    }
+
+    static func decideNetworkChange(state: VPNState, busy: Bool, rememberedKey: String?,
+                                    autoReconnectEnabled: Bool,
+                                    transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
+        guard transport != .interactiveSudo else { return PowerPlan() }
+        guard !busy else { return PowerPlan() }
+        var plan = PowerPlan()
+        guard case let .connected(key, _) = state else {
+            // Already disconnected and the network just moved: this is precisely the
+            // stranded case reconcile exists for, and notifying on every Wi-Fi hop while
+            // not connected would be noise.
+            //
+            // No re-dial either, unlike decideDidWake's otherwise-identical branch.
+            // That asymmetry is DELIBERATE: a path change tore nothing down, so there
+            // is nothing to restore, whereas a wake may follow a sleep in which this
+            // app itself tore a live tunnel down. Making the two agree would either
+            // re-dial on every Wi-Fi hop or abandon a tunnel the sleep removed.
+            plan.steps = [.reconcile]
+            return plan
+        }
+        // Never an attempt to repair a half-live tunnel (FR-3.5): its routes were built
+        // for a gateway that is no longer on this network.
+        plan.steps = [.forceTeardown, .reconcile]
+        plan.suppressDisconnectEdge = true
+        plan.rememberKey = key
+        plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
+                                          autoReconnectEnabled: autoReconnectEnabled,
+                                          notifyWhenUnavailable: true)
+        return plan
+    }
+
+    /// The suffix of every re-dialling plan, and STILL the single place a `.redial` is
+    /// ever emitted — which is the mechanism behind "at most one re-dial per event"
+    /// (FR-3.10): a re-dial or a notification, never both and never two.
+    ///
+    /// `notifyWhenUnavailable` is what the wake path turns off. A notification is only
+    /// honest when something was actually lost, so it is emitted on the branches where
+    /// a teardown was just planned and suppressed on the wake branch that found the app
+    /// already disconnected. Expressed as a parameter rather than by skipping the call,
+    /// so the re-dial decision keeps living in one function.
+    private static func redialOrNotify(rememberedKey: String?,
+                                       autoReconnectEnabled: Bool,
+                                       notifyWhenUnavailable: Bool) -> [NetStep] {
+        if autoReconnectEnabled, let key = rememberedKey { return [.redial(key: key)] }
+        return notifyWhenUnavailable ? [.notify(Self.redialUnavailableNotice)] : []
+    }
+
+    func handleWillSleep() {
+        let p = Self.decideWillSleep(state: state, busy: busy,
+                                     transport: VPNRunner.shared.cachedTransportSnapshot())
+        NSLog("AnywayConnect: willSleep — \(p)")
+        // `.distantFuture`, not now + 60: nothing of ours runs while the machine is
+        // asleep and sleep's duration is unknown, so any finite deadline armed here is a
+        // coin flip on wake. handleDidWake's unconditional overwrite is what bounds it.
+        if p.suppressDisconnectEdge { suppressDisconnectEdgeUntil = .distantFuture }
+        if let k = p.rememberKey { lastEndpointKey = k }
+        // The ONE synchronous path, and the only main-thread block permitted here: macOS
+        // does not wait indefinitely for willSleep observers, so the teardown has to be
+        // attempted now, bounded at FR-3.7's 5s.
+        //
+        // It deliberately BYPASSES runSteps, and is therefore the one documented
+        // exception to "at most one event's sequence runs at a time": the whole value of
+        // a will-sleep teardown is that it happens before the network disappears, and it
+        // is bounded and idempotent, so overlapping a wake sequence cannot compound.
+        if p.steps.contains(.forceTeardown) { boundedTeardown(limit: 5) }
+        NSLog("AnywayConnect: willSleep done")
+    }
+
+    func handleDidWake() {
+        let p = Self.decideDidWake(state: state, busy: busy, rememberedKey: lastEndpointKey,
+                                   autoReconnectEnabled: ConfigStore.shared.config.general
+                                       .autoReconnect.enabled,
+                                   transport: VPNRunner.shared.cachedTransportSnapshot())
+        NSLog("AnywayConnect: didWake — \(p)")
+        // UNCONDITIONAL, not `if p.suppressDisconnectEdge`: this is the only thing that
+        // bounds the `.distantFuture` handleWillSleep armed, so a suppression cannot
+        // survive the wake that consumes it.
+        suppressDisconnectEdgeUntil = p.suppressDisconnectEdge
+            ? Date().addingTimeInterval(60) : nil
+        if let k = p.rememberKey { lastEndpointKey = k }
+        runSteps(p.steps, event: "wake")
+    }
+
+    func handleNetworkChange(_ primary: String) {
+        let p = Self.decideNetworkChange(state: state, busy: busy,
+                                         rememberedKey: lastEndpointKey,
+                                         autoReconnectEnabled: ConfigStore.shared.config.general
+                                             .autoReconnect.enabled,
+                                         transport: VPNRunner.shared.cachedTransportSnapshot())
+        NSLog("AnywayConnect: path change -> \(primary) — \(p)")
+        // Conditional here, unlike the wake: a path change must not clear a live sleep
+        // suppression it knows nothing about.
+        if p.suppressDisconnectEdge { suppressDisconnectEdgeUntil = Date().addingTimeInterval(60) }
+        if let k = p.rememberKey { lastEndpointKey = k }
+        runSteps(p.steps, event: "netchange")
+    }
+
+    private func runSteps(_ steps: [NetStep], event: String) {
+        guard !steps.isEmpty else { return }
+        // The try-lock, taken on the notification thread: the carry-home transition
+        // produces a wake AND a debounced path change, and without this they would start
+        // two executors whose `.forceTeardown` steps race on teardownNow().
+        guard stepsRunning.wait(timeout: .now()) == .success else {
+            NSLog("AnywayConnect: \(event): steps skipped — a sequence is already in flight")
+            return
+        }
+        // The SEMAPHORE itself is captured, not `self`: a deallocated AppDelegate must
+        // not strand the try-lock closed for the rest of the process's life.
+        let sem = stepsRunning
+        stepQueue.async { [weak self] in
+            defer { sem.signal() }
+            guard let self else { return }
+            for step in steps {
+                switch step {
+                case .forceTeardown:
+                    // No DispatchQueue.main.sync anywhere in this executor: the flags
+                    // were applied by the handler before dispatch, and will-sleep can
+                    // hold main for up to 5s, so a main.sync here would be a 5s stall.
+                    VPNRunner.shared.teardownNow()
+                case .reconcile:
+                    _ = VPNRunner.shared.reconcileNow(reason: event)    // BLOCKS, by design
+                case .redial(let key):
+                    // async, not sync: `.redial` is the LAST step of every plan, so
+                    // nothing downstream waits on it, and startConnect must run on main.
+                    DispatchQueue.main.async { self.beginRedial(key) }
+                case .notify(let text):
+                    DispatchQueue.main.async { self.notify(text) }
+                }
+            }
+            NSLog("AnywayConnect: \(event): steps complete (\(steps.count))")
+        }
+    }
+
+    private func beginRedial(_ key: String) {
+        NSLog("AnywayConnect: re-dialling \(key) — one attempt")
+        // ── F5 SEAM ──────────────────────────────────────────────────────────────────
+        // One attempt, never more. startConnect routes into interactive browser SSO
+        // (--external-browser), so an unattended re-dial cannot complete: burning
+        // maxRetries here would produce five useless notifications and nothing else.
+        // Making this succeed with no user present means caching or reusing the session
+        // cookie, which is F5 and explicitly out of scope. Do not add a retry loop
+        // here, and do not cache the cookie here; fix F5 instead.
+        //
+        // The one-attempt bound comes from the decided plan — decideDidWake and
+        // decideNetworkChange each emit at most one .redial — and runSteps drops a
+        // second event's sequence while one is in flight. reconnectAttempts is
+        // therefore reset freely: if the user IS present and this attempt succeeds, a
+        // later genuine drop still gets the full configured budget from
+        // handleUnexpectedDisconnect().
+        // ─────────────────────────────────────────────────────────────────────────────
+        reconnectAttempts = 0
+        startConnect(key)       // itself a no-op while `busy`
+    }
+
+    /// Tear the tunnel down off-main but wait for it, for at most `limit` seconds.
+    private func boundedTeardown(limit: TimeInterval) {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            VPNRunner.shared.teardownNow()
+            done.signal()
+        }
+        // On expiry we return and let it finish in the background rather than hold the
+        // main thread: the tunnel either came down on the old network — the point of
+        // doing this at all — or the wake's reconcile cleans up after it.
+        _ = done.wait(timeout: .now() + limit)
     }
 
     // MARK: - Actions
@@ -582,21 +960,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // whole switch rather than only once the connect phase starts.
         connectingKey = key
         busy = true; updateButton(); rebuildMenu()
+        // The hang this half can suffer is a teardown that never completes, so it is
+        // guarded on the disconnect bound. `startConnect(key)` below re-arms on the
+        // connect bound for the second half.
+        startBusyWatchdog(.disconnect)
         notify("Switching to \(labelFor(key))…")
         VPNRunner.shared.disconnect { [weak self] in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.busy = false; self?.startConnect(key) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self?.stopBusyWatchdog()
+                self?.busy = false
+                self?.startConnect(key)
+            }
         }
     }
 
-    /// Escape hatch for a connect that isn't finishing.
+    /// Escape hatch for a connect that isn't finishing. CONNECT ONLY.
     ///
     /// Kills the authentication child, which is what unblocks the reader waiting on
     /// its pipes. If there is nothing to kill the UI is wedged for some other
     /// reason, so clear `busy` regardless rather than leaving the user stuck.
+    ///
+    /// A disconnect has no authentication child, so `cancelInFlight()` would find
+    /// nothing to kill and the teardown would carry on privileged-side regardless —
+    /// the item that calls this is therefore not offered while disconnecting, and the
+    /// guard below enforces that rather than trusting the menu to be the only caller.
+    /// A hung disconnect is recovered by its watchdog instead.
     @objc func cancelBusy() {
-        guard busy else { return }
+        guard busy, connectingKey != nil else { return }
         let killed = VPNRunner.shared.cancelInFlight()
-        notify(killed ? "Stopping…" : "Cancelled")
+        // "Cancelled" was wrong in the `!killed` branch: nothing was cancelled there,
+        // because there was nothing in flight to cancel. All that happened is that the
+        // UI stopped claiming to be busy.
+        notify(killed ? "Stopping…" : "Nothing to stop — status cleared")
         if !killed {
             stopBusyWatchdog()
             busy = false
@@ -605,20 +1000,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Which direction a watchdog is guarding.
+    ///
+    /// Passed in rather than read off `connectingKey` when the timer fires, because
+    /// `switchTo(...)` sets `connectingKey` for the whole switch — including its
+    /// disconnect half, which is the half that can hang there.
+    private enum BusyKind {
+        case connect, disconnect
+
+        /// How long to wait before declaring the operation dead.
+        ///
+        /// A connect gets 240s because its slow step is a human: authentication hands
+        /// off to a browser for SSO and someone has to read an MFA prompt.
+        ///
+        /// A disconnect gets 60s, because nothing in that path waits for a person. Its
+        /// worst case is `teardownNow()`'s own bounds added up: up to 3s probing the
+        /// privileged transport, up to 30s for the daemon's `stopTunnel` XPC call
+        /// (`pgrep` 5s + `ps` 3s + the 10s SIGINT wait + the 5s SIGTERM wait = 23s in
+        /// the daemon, plus slack), then 3s for the batched `ps` that establishes which
+        /// discovered pids are ours, up to 5s for `helperIsUsable()` and ~10s in the
+        /// shell helper's `stop`, which SIGINTs openconnect, waits 10s and only then
+        /// escalates to SIGTERM — the daemon's own `stopTunnel` does the same. That is
+        /// 3 + 30 + 3 + 5 + 10 ≈ 51s, so 60s still cannot fire on a merely slow
+        /// teardown, with the margin roughly halved.
+        ///
+        /// Those last three terms used to describe a path that could not be taken: the
+        /// daemon's reply was unconditionally `ok`, so the daemon arm always returned
+        /// and the sudo fallback was unreachable after a daemon stop. It is REACHABLE
+        /// now — a stop that found something and did not stop it replies `.failed`, on
+        /// which the app keeps its endpoint record and falls through.
+        ///
+        /// Reusing 240s here would leave the user with no way back for four minutes,
+        /// which matters more now that the escape hatch is not offered during a
+        /// disconnect.
+        var timeout: TimeInterval {
+            switch self {
+            case .connect:    return 240
+            case .disconnect: return 60
+            }
+        }
+
+        var noun: String {
+            switch self {
+            case .connect:    return "connect"
+            case .disconnect: return "disconnect"
+            }
+        }
+    }
+
     /// Last-resort guard against a permanently stuck UI.
     ///
     /// The authentication step is time-bounded now, so completion should always
     /// arrive. This exists because the cost of being wrong is a menu bar that never
     /// recovers, and the cost of the guard is a timer.
-    private func startBusyWatchdog() {
+    ///
+    /// Armed by every path that sets `busy = true`, and since it invalidates the
+    /// previous timer first, at most one can exist at a time.
+    private func startBusyWatchdog(_ kind: BusyKind) {
         stopBusyWatchdog()
-        busyWatchdog = Timer.scheduledTimer(withTimeInterval: 240, repeats: false) { [weak self] _ in
+        busyWatchdog = Timer.scheduledTimer(withTimeInterval: kind.timeout,
+                                            repeats: false) { [weak self] _ in
             guard let self = self, self.busy else { return }
-            NSLog("AnywayConnect: connect never completed; clearing busy state")
-            VPNRunner.shared.cancelInFlight()
+            NSLog("AnywayConnect: \(kind.noun) never completed; clearing busy state")
+            // Only a connect has an authentication child to kill. During a disconnect
+            // there is nothing to cancel — and interrupting the teardown is exactly how
+            // this app used to leave orphaned routes behind — so just unstick the UI and
+            // let the privileged side finish.
+            if case .connect = kind { VPNRunner.shared.cancelInFlight() }
+            self.stopBusyWatchdog()
             self.busy = false
             self.connectingKey = nil
-            self.notify("Connect gave up — see Logs")
+            self.notify("\(kind.noun.capitalized) gave up — see Logs")
             self.refresh()
         }
     }
@@ -633,7 +1085,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let profile = ConfigStore.shared.activeProfile else { notify("No active profile"); return }
         connectingKey = key
         busy = true; updateButton(); rebuildMenu()
-        startBusyWatchdog()
+        startBusyWatchdog(.connect)
         notify("Connecting to \(labelFor(key))… complete SSO in the browser.")
         VPNRunner.shared.connect(profile: profile, endpointKey: key, force: true) { [weak self] result in
             guard let self = self else { return }
@@ -692,7 +1144,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // while this runs — `busy` alone would otherwise be ambiguous.
         connectingKey = nil
         busy = true; updateButton(); rebuildMenu()
+        // A disconnect had no watchdog at all, which was survivable only because the
+        // "Stop" item used to appear on `busy` either way round. It no longer does —
+        // it cannot keep that promise during a teardown — so this timer is now the
+        // ONLY thing standing between a lost completion and a menu bar that never
+        // recovers short of quitting the app.
+        startBusyWatchdog(.disconnect)
         VPNRunner.shared.disconnect { [weak self] in
+            self?.stopBusyWatchdog()
             self?.busy = false; self?.notify("Disconnected"); self?.refresh()
         }
     }
@@ -784,7 +1243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusTitle: String
         let statusColor: NSColor
         switch stateForIcon() {
-        case .connecting:
+        // One title for both directions. The row says only that something is in
+        // flight; which direction it is shows in the items below it.
+        case .connecting, .disconnecting:
             statusTitle = "Working…"; statusColor = .systemOrange
         case .connected:
             statusColor = .systemGreen
@@ -799,10 +1260,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let p = profile { addDisabled(menu, "Profile: \(p.name)", sym("folder")) }
         if case let .connected(_, host) = state { addDisabled(menu, host, sym("network")) }
 
-        // While busy, this is the only enabled action in the menu — every other
-        // item is disabled on `busy`. Without it a connect that never finishes left
-        // no way back short of quitting the app.
-        if busy {
+        // While a CONNECT is in flight this is the only action that can still change
+        // the connection — every other row that touches the connection is disabled on
+        // `busy`. Without it a connect that never finishes left no way back short of
+        // quitting the app.
+        //
+        // Gated on `connectingKey`, not on `busy`: `busy` is also true while
+        // DISCONNECTING, and there this item cannot do what it says. `cancelBusy()`
+        // kills the authentication child, which is a connect-only process; during a
+        // teardown there is none, so the click killed nothing, said "Cancelled", and
+        // the teardown carried on in the privileged daemon anyway. Hidden rather than
+        // disabled because the status row above already reads "Working…", so a greyed
+        // row would add nothing but noise.
+        //
+        // And deliberately NOT made to work instead: interrupting vpnc-script partway
+        // through is precisely how this app produced orphaned routes and a stale DNS
+        // override. A slow teardown is strictly better than a half-run one. The hung
+        // case is covered by `startBusyWatchdog(.disconnect)`, which clears the UI
+        // without touching the network.
+        if busy, connectingKey != nil {
             menu.addItem(.separator())
             let cancel = item("Stop Connecting", #selector(cancelBusy), ".", sym("stop.circle"))
             cancel.isEnabled = true
@@ -821,11 +1297,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item("Refresh status", #selector(doRefresh), "r", sym("arrow.clockwise")))
             menu.addItem(.separator())
             menu.addItem(item("Quit AnywayConnect", #selector(quitApp), "q", sym("xmark.rectangle")))
-            return menu
+            return Self.showingImages(menu)
         }
 
         if case .connected = state {
-            menu.addItem(item("Disconnect", #selector(disconnectMenu), "d", sym("bolt.slash")))
+            let disc = item("Disconnect", #selector(disconnectMenu), "d", sym("bolt.slash"))
+            // `disconnectMenu()` returns immediately on `busy`, so mid-operation this
+            // row was live-looking and inert: clicking it did nothing, silently. And
+            // `state` is still `.connected` throughout a teardown, so this is exactly
+            // the row the user reaches for when a disconnect is taking its time.
+            disc.isEnabled = !busy
+            menu.addItem(disc)
             menu.addItem(.separator())
             addDisabled(menu, "Switch endpoint", sym("arrow.left.arrow.right"))
         } else {
@@ -842,7 +1324,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let favs = p.endpoints.filter { $0.favorite }
             let pinned = favs.isEmpty ? p.endpoints : favs
             for ep in pinned {
-                // mark() decides the image: a tick for the one in use, nothing for the rest.
+                // mark() decides the image: a tick for the one in use, an empty column
+                // for the rest.
                 let it = item(ep.label, #selector(connectMenu(_:)), "", nil)
                 it.representedObject = ep.key; it.isEnabled = !busy
                 mark(it, ep.key)
@@ -852,7 +1335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // listed above.
             if p.endpoints.count > pinned.count {
                 let allItem = NSMenuItem(title: "All endpoints", action: nil, keyEquivalent: "")
-                allItem.image = sym("list.bullet")
+                allItem.image = sym("list.bullet") ?? Self.blankMark
                 let allMenu = NSMenu()
                 allMenu.autoenablesItems = false
                 for ep in p.endpoints {
@@ -874,11 +1357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if cfg.profiles.count > 1 {
             menu.addItem(.separator())
             let profItem = NSMenuItem(title: "Profile", action: nil, keyEquivalent: "")
-            profItem.image = sym("folder")
+            profItem.image = sym("folder") ?? Self.blankMark
             let profMenu = NSMenu()
             for p in cfg.profiles {
                 // Same treatment as the endpoints: only the active one is ticked, and the
-                // rest are left unmarked rather than repeating a folder on every row.
+                // rest get the empty column rather than repeating a folder on every row.
                 let active = p.id == cfg.activeProfileID
                 let it = item(p.name, #selector(switchProfile(_:)), "",
                               active ? sym("checkmark") : nil)
@@ -918,16 +1401,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `.rectangle`, which is landscape at 18x14, not `.square`/`.app` — those two are
         // the same 15x14 glyph as each other, so swapping between them changes nothing.
         menu.addItem(item("Quit AnywayConnect", #selector(quitApp), "q", sym("xmark.rectangle")))
+        return Self.showingImages(menu)
+    }
+
+    /// Ask AppKit to actually draw the images this menu has been given.
+    ///
+    /// macOS 27 took that decision away from the app: `NSMenuItem.image`'s own
+    /// documentation now says "AppKit determines the visibility of menu item images, and
+    /// will typically hide images", and what it hides in practice is every SF Symbol —
+    /// so the whole symbol column vanished while the drawn `statusDot` stayed. The
+    /// released v1.0.0 still shows its symbols on the same OS because the behaviour is
+    /// keyed to the SDK a binary was linked against (that build: 15.5, ours: 26.5+), so
+    /// nothing in this app's own history caused it and nothing in it can be reverted to
+    /// get the symbols back. The opt-out is `preferredImageVisibility = .visible`.
+    ///
+    /// Set through the ObjC runtime rather than the typed API because the property is
+    /// macOS 27 SDK-only, and build-app.sh compiles against whatever SDK the local
+    /// toolchain has — naming it directly would break the build on Xcode 26, and on
+    /// GitHub Actions, where v1.0.0 was built. `responds(to:)` makes it a no-op on
+    /// macOS 26 and earlier, which never hid these images in the first place.
+    ///
+    /// Applied to every item carrying an image, including the non-symbol status dot:
+    /// the documentation's "typically" promises nothing about what a later release will
+    /// keep drawing, and the one thing worth preventing is this happening again.
+    /// Recursive, so the "All endpoints" and "Profile" submenus are covered too.
+    private static func showingImages(_ menu: NSMenu) -> NSMenu {
+        for i in menu.items {
+            if i.image != nil, i.responds(to: Self.setPreferredImageVisibility) {
+                // NSMenuItemImageVisibilityVisible. Spelled as a number because the enum
+                // does not exist in the SDK this may be compiled against.
+                i.setValue(NSNumber(value: 1), forKey: "preferredImageVisibility")
+            }
+            if let sub = i.submenu { _ = showingImages(sub) }
+        }
         return menu
     }
+    private static let setPreferredImageVisibility = Selector(("setPreferredImageVisibility:"))
 
     /// Mark an endpoint row: connected, connecting, or neither.
     ///
     /// Only the endpoint you are on is marked. Giving every endpoint a globe filled the
     /// column with a glyph that said nothing — each row is an endpoint, so drawing that on
     /// all of them is noise, and it left the one row that mattered competing with a dozen
-    /// identical neighbours. Unmarked rows still line up: one image anywhere in the section
-    /// reserves the column for all of it.
+    /// identical neighbours. An unmarked row gets `blankMark`, not nil, which is what
+    /// keeps it lined up with its marked neighbours.
     ///
     /// Still a literal tick, as a macOS menu uses for "this is the current one" — the Wi-Fi
     /// menu included — but in the image column rather than the checkmark column beside it.
@@ -946,20 +1463,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if busy, connectingKey == key {
             item.image = sym("ellipsis")
         } else {
-            item.image = nil
+            item.image = Self.blankMark
         }
     }
 
-    /// An SF Symbol for a menu row, or nil where a row is deliberately unmarked.
+    /// An SF Symbol for a menu row, or nil if this OS does not have that symbol.
     ///
-    /// A row's image is what sets the title's left edge. A menu reserves that column per
-    /// section between separators, so a section needs only *one* image for every title in
-    /// it to line up — which is why unmarked rows still sit correctly beside marked ones.
+    /// A row's image is what sets the title's left edge, and on macOS 27 that is *per
+    /// row*: a nil image means no indent at all. It did not used to be — a menu reserved
+    /// the column per section between separators, so one image anywhere in a section
+    /// lined up every title in it, which is why unmarked rows used to sit correctly
+    /// beside marked ones. That reservation is gone (the same image-visibility change
+    /// `showingImages(_:)` works around), and without it the three endpoint rows, nil
+    /// while disconnected, sat 22pt left of every other row in the menu. So nil from
+    /// here is turned into `blankMark` by whoever assigns it, and the only rows with a
+    /// genuinely absent image are the ones AppKit never draws anyway.
+    ///
     /// macOS 26 supplies a gear for "Settings…" unasked, and it was that lone image
     /// indenting one section and nothing else that made the padding look arbitrary.
     private func sym(_ name: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
+
+    /// The image column, reserved but empty: a fully transparent image in the same
+    /// geometry a real mark occupies.
+    ///
+    /// Only the endpoint you are on carries a tick, and only one profile is active, so
+    /// most rows in those two sections have nothing to show. Before macOS 27 they could
+    /// be left nil and still line up; now a nil image collapses that row's title flush
+    /// to the menu's left edge, and a menu with marked and unmarked rows in it ends up
+    /// with two different left edges. This is what an unmarked row gets instead.
+    ///
+    /// Transparent rather than, say, a dimmed glyph: the row has nothing to say, and the
+    /// only job here is the 22pt the column is worth. Nothing is drawn into the bitmap,
+    /// so it cannot be a visible blob in either appearance, and at the same 16pt as
+    /// `statusDot` it cannot change a row's height either.
+    ///
+    /// A `static let`, because the menu is rebuilt on every 8s status poll and this would
+    /// otherwise be a fresh allocation per unmarked row per rebuild. Appearance-
+    /// independent, unlike `statusDot`, so there is nothing to invalidate.
+    ///
+    /// `showingImages(_:)` will tell this one to be visible along with the rest. That is
+    /// harmless — there is nothing in it to see.
+    private static let blankMark: NSImage = {
+        let img = NSImage(size: NSSize(width: 16, height: 16))
+        // Gives it a real, fully transparent representation; an NSImage with no
+        // representation at all is not reliably treated as an image to make room for.
+        img.lockFocus()
+        img.unlockFocus()
+        return img
+    }()
 
     /// A coloured status dot, drawn rather than borrowed from SF Symbols.
     ///
@@ -981,17 +1534,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
+    // Both of these fall back to `blankMark` rather than leaving the image nil, so that
+    // every row this menu can emit reserves the column — including a row passed nil
+    // deliberately, and a row whose `sym(_:)` came back nil because the symbol is not on
+    // this OS. One left edge per menu, in every state.
     private func addDisabled(_ menu: NSMenu, _ title: String, _ image: NSImage?) {
         let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         i.isEnabled = false
-        i.image = image
+        i.image = image ?? Self.blankMark
         menu.addItem(i)
     }
     private func item(_ title: String, _ action: Selector, _ key: String,
                       _ image: NSImage?) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
         i.target = self
-        i.image = image
+        i.image = image ?? Self.blankMark
         return i
     }
 

@@ -72,7 +72,18 @@ Layout, top to bottom:
 2. **Profile** and, when connected, the **gateway host** it actually reached.
 3. **Stop Connecting** — only while busy, and the only enabled row then. Without
    it a connect that never finished left no way out but quitting.
-4. **Disconnect** when connected, otherwise a "Connect to" header.
+4. **Disconnect** when connected, otherwise a "Connect to" header. A stop that
+   cannot stop the tunnel now **says so and keeps the connection's record**,
+   instead of reporting success and leaving the menu reading "Connected: ?" —
+   which is what happened when the record was cleared while `openconnect` was
+   still alive and the next status poll found the tunnel with nothing to name it.
+   The rule behind it, in general form: **no transport signals a process it has
+   not identified**. So Disconnect will stop an `openconnect` the app did not
+   start — one left by an earlier session, or started over a different backend —
+   but only after confirming that it is one, by the markers this app passes it;
+   and it **names in the log any process it refuses to signal**, because that is
+   what you need to finish the teardown by hand. The cost is stated rather than
+   hidden: if that confirmation cannot be made, nothing is signalled at all.
 5. **Endpoints** — favourites if any are marked, otherwise all of them. An "All
    endpoints" submenu appears only when it would reveal something not already
    listed. Only the endpoint in use is marked, with a tick; one being connected
@@ -201,7 +212,20 @@ addressed directly (trust comes from `--servercert=<fingerprint>`, so hostname
 validation isn't needed), then the hostname with `--resolve=<hostname>:<ip>`
 pointing at that same node, then a plain lookup as a last resort. Every attempt
 is recorded in `~/.config/anyway-connect/state/openconnect.log`. If none confirm,
-the tunnel is torn down and the previous default route restored.
+the tunnel is torn down and a working default route restored.
+
+Restored, not replayed. The snapshot taken before the tunnel records only *which*
+interface carried the default, never the gateway address: the privileged side
+re-derives the next hop from the live system (DHCP first, then the routing table,
+then the recorded hint — and only if the interface and its subnet still match) and
+refuses to install anything no candidate can justify. Replaying a captured address
+is what blackholed a laptop carried from one network to another, so a refusal
+leaves routing untouched and says why in the log rather than guessing.
+
+The same repair runs once at app launch, when no tunnel is alive: leftover VPN
+routes and DNS overrides from a crash or a forced sleep are cleared and a usable
+default put back. It needs a privileged backend, happens off the launch path, and
+mutates nothing if a tunnel is running.
 
 A watchdog clears the busy state if a connect never completes, so the menu cannot
 be left permanently stuck. **Stop Connecting** kills the authentication child,
@@ -212,6 +236,223 @@ which is what unblocks the reader waiting on its pipes.
 Off by default. When on, a dropped tunnel is redialled up to the configured
 number of times with the configured delay. A disconnect you asked for is never
 redialled — the two are distinguished explicitly rather than inferred.
+
+## Network changes, sleep and wake
+
+The reported failure was a laptop carried from the office to home: `openconnect`
+was still alive, so nothing noticed anything was wrong, while every route still
+pointed at a gateway on a network two hops away. The machine had no internet and
+the VPN did not come back.
+
+Three things now notice.
+
+**An interface watch.** `NWPathMonitor` reports the system's available interfaces;
+the first non-tunnel one is taken as the primary. A change of primary — and only
+a change of primary — is acted on, so the tunnel's own `utun` coming up or going
+down is not mistaken for a move. Updates are coalesced over a 3-second quiet
+period with a 10-second ceiling, because a Wi-Fi roam emits a burst of them and
+one move should cost one repair. Every update is logged, both the ones acted on
+and the ones deliberately ignored, with the reason and the full interface list.
+
+**Sleep.** Before the machine suspends, a connected tunnel is torn down *while
+the old network is still present*, which is what lets the disconnect script run
+against the gateway the routes were built for. That teardown is bounded at five
+seconds: macOS does not wait indefinitely for a sleep observer.
+
+**Wake, and a network change while connected.** A live tunnel is treated as dead
+rather than repaired — its routes belong to a network that is gone — then the
+privileged reconcile below runs, and only then is one re-dial attempted. The
+order matters: reconcile refuses to touch anything while the tunnel process is
+alive, so repairing first and reconciling after would reliably do nothing.
+
+Only one such sequence runs at a time. A carry-home produces a wake *and* a
+debounced path change, and the second one is dropped with a logged reason instead
+of being queued behind a repair that has already superseded it.
+
+**The honest outcome: notify, don't retry.** Exactly one re-dial is attempted,
+never more. Signing in goes through the browser, so an unattended attempt cannot
+complete on its own and five of them would only produce five notifications. With
+auto-reconnect off, or with no endpoint remembered, there is no attempt at all —
+just one notification. So after a carry-home you should expect **internet
+working, VPN down, one notification**, and the sign-in is yours to finish.
+
+That notification is only sent when something was actually lost: a tunnel this
+app had just torn down for the sleep or the network change. Waking a machine that
+was *already* disconnected repairs the network silently — no "VPN dropped" for a
+drop that never happened — and still re-dials if auto-reconnect is on and an
+endpoint is remembered, because a sleep can be the thing that removed the tunnel.
+A network change while already disconnected repairs and nothing more: nothing was
+torn down, so there is nothing to restore.
+
+### The privileged reconcile
+
+The repair itself needs root and runs privileged-side, where it derives every
+address from the live system rather than being told one. It:
+
+- removes the leftover `State:/Network/Service/<utun>/IPv4` and `/DNS` overrides
+  that keep DNS pointed at a tunnel that no longer exists;
+- removes a default route that still points at a `utun`;
+- deletes routes whose next hop is outside every live link's subnet, capped at
+  256 destinations per run so one pathological table cannot stall the machine. A
+  next hop that sits *inside* a live link's subnet is kept even when it could
+  never be installed as a gateway — the link's own address, or the subnet's
+  network or broadcast address — because the link that would carry it is present
+  and working;
+- installs a physical default route only when it can justify the next hop, and
+  leaves routing untouched when it cannot. A link the reconcile has already
+  judged unusable — absent from the interface snapshot, down, or carrying no
+  IPv4 — is never chosen as the install target, even when the route table still
+  holds a default row naming it. When two links both carry a usable default, the
+  one the kernel lists first is preferred, and when neither can be told apart the
+  reconcile records the ambiguity and installs nothing rather than guessing a
+  network.
+
+It **refuses to do anything at all while a tunnel process is alive** — judged
+from both the pid file and a process scan, not from the pid file alone — so a
+healthy session is never disturbed. That same process scan is what lets
+**Disconnect stop a tunnel the daemon did not start**: the pid file goes stale
+(`openconnect` removes it on its own graceful exit, and a tunnel started over
+another backend was never in it), so a stop that read only that file would find
+nothing and report that nothing was running. The scan finds it, the identity
+check establishes that it is one of ours, and only then is it signalled. The two
+uses of the scan are deliberately not symmetric: it is trusted to say "do not
+touch routing", never "you may not connect", and "this is what to signal" only
+after the identity check agrees. It runs at app launch, on wake, and on a network
+change, and every plan entry and its outcome goes to the daemon log.
+
+#### Which tunnels it will touch
+
+The reconcile acts on a tunnel in exactly two cases: when its interface **no
+longer exists**, so nothing running can own it; or when it can positively
+identify the tunnel as its own **by name and by the address that tunnel was
+carrying** while the app held it. It never touches a live tunnel it cannot
+identify that way, whoever it belongs to.
+
+That means a third-party VPN — Tailscale, Zscaler, a profile-installed IKEv2
+tunnel — is protected by **being up**, not by appearing on any list. One brought
+up before a connect, during a session, or next week is treated identically,
+because the question asked is "is this interface alive, and is it the one we
+recorded?" rather than "was it on the list we wrote when we connected?".
+
+"Its interface no longer exists" is decided before any command runs, so the
+interface list is **read again immediately before the first one does**. A tunnel
+that came up inside that window keeps its resolver overrides and its default
+route, and the reconcile says which actions it dropped and why. If the install
+of a physical default was only possible because that tunnel's default route was
+going to be removed, the install is dropped with it and reported as withheld —
+the kernel's `default` slot is occupied again, so the install could only fail,
+and reporting it as done is the failure mode this whole section exists to
+prevent.
+
+#### What it stopped doing, and what that leaves behind
+
+This is a simpler rule than the one before it, and it repairs strictly less. The
+cases where it now leaves state behind, named rather than discovered:
+
+- **With an unusable interface snapshot it emits nothing at all** — no route
+  deletion and, unlike before, no configd removal either. If the interface list
+  cannot be read, there is no way to tell whether a `utun`'s resolver override
+  belongs to something that is still running, and clearing somebody else's DNS
+  because we are blind is the wrong way to be wrong. The reconcile records the
+  unusable snapshot and the next run — at launch, on wake, on a network change —
+  does the repair.
+- A lingering `utun` **of ours with no witnessed address** is left alone until
+  its interface goes. So is one whose session never resolved an identity: the
+  observation was ambiguous, it timed out, openconnect exited before its
+  interface appeared, or the interface appeared and never took an address.
+- A tunnel started by a **daemon from before this change**, or one whose
+  identity record could not be written, is in the same position.
+- Every connect over the **sudoers-helper** backend is too (see below).
+
+In all of those the residue — the tunnel's default route and its resolver
+override — survives until the interface itself goes, which a disconnect that
+runs the route script to completion, or a reboot, both achieve. The reported
+carried-home failure is **not** in that set: there the `utun` was already gone,
+which is the case the first rule covers with no record of any kind.
+
+One more thing it now refuses to do: when an **unscoped default route that the
+plan is not deleting survives** — a protected tunnel's, or a kept physical one —
+the install is **withheld and reported as withheld** rather than attempted. The
+kernel already has a default in that slot, so `route add default` could only
+fail, and the old behaviour was to issue it anyway and write "install default …"
+into the transcript regardless of the answer.
+
+A stale physical default — the carried-home `default 10.0.1.1` on a `192.168.1.0/24`
+link — is removed on **both** backends, and only ever as the first half of
+"remove the dead one, install a guarded replacement": the removal and the install
+are one operation, never a removal on its own. If the install nevertheless fails,
+the reconcile reports a failure rather than claiming it repaired the network.
+
+One asymmetry worth knowing: on the **sudoers-helper** backend the reconcile does
+the un-wedging essentials (the configd keys, the tunnel default route, the stale
+physical default and the guarded replacement) but **does not sweep** dead-gateway
+routes. Porting a route-table parser and a mass deletion into POSIX shell would
+duplicate the riskiest code in the place it can be tested least. The daemon
+backend sweeps.
+
+That backend has a second, narrower asymmetry, from the identity rule above. It
+can **read** the identity record but can never write one: it hands the process
+over to `openconnect` with nothing of itself left running, so there is nobody to
+watch for the interface to appear. On that backend the reconcile therefore
+repairs one of our own tunnels only **after its interface has gone** — a
+lingering `utun` keeps its default route and its resolver keys until then. It is
+strictly safer and strictly less repairing than the daemon backend, and the
+trade is deliberate: the fallback transport is the one with the least evidence,
+so it is the one that should act least.
+
+## Diagnosing a wedged network — `scripts/anyway-diag.sh`
+
+When the machine comes back from sleep with no usable network, the first question
+is not *how do I fix it* but **is this AnywayConnect's fault at all**. Twice that
+question has cost a reboot, and the second time a full read-only investigation
+found the answer was no: Cisco Secure Client's socket filter extension was
+failing every socket write with errno 49 while this app's routing and DNS were
+provably clean. The script exists to answer that in half a minute instead of a
+day.
+
+```sh
+sh scripts/anyway-diag.sh            # ~20s, full
+sh scripts/anyway-diag.sh --quick    # ~10s, skips the unified-log queries
+sh scripts/anyway-diag.sh --no-pmset # skips the slow power-log read
+```
+
+It is **read-only and needs no sudo**, so it is safe to run mid-incident without
+reading it first — no `route`/`scutil`/`networksetup`/`ifconfig` writes, no
+`launchctl` load/unload, no signals to the app, the daemon or `openconnect`, and
+it never reads `config.json`. It reports, in order: whether a long sleep
+preceded a recent wake (the carry-home signature); the app's, daemon's and
+`openconnect`'s state, including whether the tunnel is parented to the daemon or
+to a `sudo` chain; every default route with its gateway, interface and
+`-ifscope` flag, judged by the *same* on-link guard the app uses, plus the count
+and list of routes whose gateway is on-link for no live interface; resolver #1
+and whether any `State:/Network/Service/utun*/{IPv4,DNS}` override is present;
+four separately-reported probes so the failing layer is visible; per-extension
+error counts for the five third-party network/endpoint extensions on this
+machine; and mDNSResponder's sent-versus-answered ratio.
+
+Then one plain verdict: *this app's fault* (and what to do), *not this app*
+(naming the extension, with a recovery cheaper than a reboot and what to capture
+first), *nothing wrong here*, or *cannot tell* — which it will say rather than
+guess. Exit status mirrors it: `0` clean, `1` this app, `2` not this app, `3`
+cannot tell.
+
+Everything it collected is written to `/tmp/anyway-diag-<timestamp>/` and the
+path is printed. The report and the captures are redacted for sharing — MAC
+addresses, configd service UUIDs, the SSID, and the names of the
+`/etc/resolver/` files and search domains are stripped, while addresses,
+subnets, gateways and route destinations are kept because they are the evidence.
+The bundle also holds `openconnect.log`, copied **before any probe runs**
+because it is truncated on every connect, and `/var/log/anyway-connect-helper.log`,
+the only log here that survives a reboot. Those two are the app's own logs and
+name your endpoints, so glance over them before attaching the bundle anywhere
+public.
+
+Two findings it reports and explicitly attributes elsewhere, because anyone
+hunting a VPN problem will otherwise suspect this app: the root-owned
+`/etc/resolver/` files that pin corporate domains to VPN-only resolvers, and the
+IP literals sitting in the Wi-Fi service's `SearchDomains`. Neither is written
+by this app, which makes no `networksetup -setdnsservers` or `-setsearchdomains`
+call at all.
 
 ## LAN bypass
 
@@ -225,6 +466,32 @@ One caveat found the hard way: the bundled `vpnc-script` sets `OverridePrimary`
 unconditionally — its own `#if`/`#fi` guard is commented out — and removing that
 silently converts a full tunnel into a split tunnel. Worth knowing before
 treating it as a knob.
+
+The same override has a second consequence, and it explains a decision in the
+reconcile: while the tunnel is up, `State:/Network/Global/IPv4`'s
+`PrimaryInterface` and `PrimaryService` both name the **tunnel**. configd's
+primary-service answer would otherwise be the obvious way to pick an install
+target, so it is deliberately not used — it names the `utun` exactly when the
+reconcile is trying to find a *physical* link, and on a post-crash table it is
+either the dead tunnel or whatever configd has recomputed. The interface snapshot
+is used instead.
+
+One asymmetry between the two privileged backends, recorded rather than fixed:
+the sudoers helper reads a link as "up" from the single `ifconfig` token `UP`,
+while the daemon requires `IFF_UP && IFF_RUNNING`. An ordinarily down link prints
+without the token and is rejected on both, so the only state the helper cannot
+see is "configured but no carrier". Teaching it to would mean adding a column to
+its interface snapshot and shifting every consumer that reads past it, including
+the on-link guard's own argument handling, to reject a state the preferred
+backend already rejects.
+
+A second delta in the same copied script: its `get_default_gw()` can answer with
+a `utun`'s *own* address — exactly the value that blackholed the carried-home
+laptop — and its `set_vpngateway_route()` only ever `add`s a route. So
+`File exists` lines still appear in the log while `openconnect` runs its own
+`attempt-reconnect`, and that is untouched here. The reconcile above cleans up
+after it rather than preventing it; the app's own restore path no longer trusts a
+captured gateway address at all.
 
 ## Privileged backends
 
@@ -281,7 +548,16 @@ a root write anywhere on the filesystem. So the daemon:
 
 Both sides report a protocol version and the app refuses a daemon older than it
 expects, falling back to sudo rather than calling it with arguments that mean
-something else. The version is currently **1**, in step with the app's own 1.0.
+something else. The XPC protocol is now **2** and the shell helper's argument
+protocol **3**: restoring a default route takes an *interface* where it used to
+take a gateway address, and `reconcile` is new. Both were bumped because an
+argument changed meaning — an older install handed a bare interface name would
+read it as an address.
+
+The consequence is visible: until the backends are reinstalled from
+**Settings ▸ General**, an installed older daemon reports as outdated and an
+older shell helper is not used at all, so privileged work falls through to the
+password prompt. Reinstalling is the whole fix.
 
 Registration is judged by the state macOS ends in, not by what `register()`
 returned: the call can throw and still have created the registration, which
@@ -313,8 +589,10 @@ argument handling, and two rules follow:
    `brew upgrade openconnect` will not update the copy.
 
 Remaining arguments — protocol, host, fingerprint, resolve, exception routes,
-pids, gateway — are validated against strict patterns, and the host is passed
-after `--` so it can never be read as an option.
+pids, and the interface a default route is to be restored on — are validated
+against strict patterns, and the host is passed after `--` so it can never be
+read as an option. No gateway address is accepted from the app any more: the
+helper derives the next hop itself and refuses one it cannot justify.
 
 ## The session cookie
 
@@ -656,13 +934,38 @@ indefinitely.
 The tests are hermetic — `mktemp`, the mock, no `HOME`, no sudo, no real
 `openconnect` — which is what lets CI run them unchanged.
 
-There is no unit-test target for the AppKit code. Behaviour there is verified by
-compiling throwaway harnesses against the real sources: copy every file in
-`AnywayConnect/` except `main.swift` into a scratch directory, add your own
-`main.swift` as the entry point (Swift only allows top-level statements in a file
-with that name), and build with `swiftc -O`.
+```
+sh test/test-onlink-guard.sh
+```
 
-Two rules learned the hard way:
+The on-link guard's case table, run against the POSIX sh port in
+`scripts/anyway-root-helper.sh`. The shell guard is a copy of, not a call into,
+`evaluateDefaultGateway`, so what keeps the two honest is one case table run
+against each arm asserting the same rejection-reason strings. Nothing live is
+touched: the helper is sourced with `ANYWAY_HELPER_SOURCE_ONLY=1` and its three
+command paths are pointed at `test/stub-*.sh`.
+
+```
+sh test/run-swift-harness.sh
+```
+
+There is no unit-test target for the AppKit code, so the pure decision layer —
+the on-link guard and the reconcile planner — is tested by compiling the real
+sources together with a committed entry point: every file in `AnywayConnect/`
+except `main.swift` (Swift allows top-level statements only in a file with that
+name, and the harness supplies its own) plus `test/harness/*.swift`, built with
+`swiftc -O` at the fixed scratch path `/tmp/anyway-scratch`.
+
+The suites are **committed**, at `test/harness/`. They used to be a throwaway
+scratch file, and losing it to a `/tmp` prune meant the recorded baseline could
+not be re-run at all. The expected route-sweep lists are re-derived from the
+checked-in `netstat` captures by `test/harness/derive-expected.sh`, which reads
+no Swift source, and the runner diffs that derivation against the committed
+lists before compiling — so the planner's answer and an independent derivation
+of it are pinned to each other rather than to themselves. See
+`test/harness/README.md`.
+
+Two rules learned the hard way, and enforced by the runner's static gates:
 
 - **Never let a harness reach `ConfigStore.shared`.** It resolves
   `~/.config/anyway-connect/config.json` in a private initialiser with no override,

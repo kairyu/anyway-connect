@@ -32,11 +32,18 @@ public func privilegedDaemonLabel() -> String {
 ///
 /// Version 1 is the first release of this protocol, in step with the app's own 1.0.
 ///
+/// Version 2: `restoreDefaultRoute`'s arguments changed meaning — the gateway parameter
+/// is gone, and the single remaining argument is the TARGET INTERFACE. A v1 daemon called
+/// with v2 arguments would read the interface name as a gateway address and refuse; worse,
+/// a v2 app talking to a v1 daemon would get the old replay-a-literal-address behaviour
+/// that this whole change exists to remove. `reconcile` is additive, but the restore
+/// change alone requires the bump.
+///
 /// Bump it whenever an argument's meaning changes — and only ever bump it. Lowering it
 /// would tell the app to accept a daemon that predates whatever the raise was protecting
 /// against, and the check exists precisely so a mismatched pair falls back to sudo rather
 /// than calling each other with arguments that mean something else.
-public let kPrivilegedProtocolVersion = 1
+public let kPrivilegedProtocolVersion = 2
 
 /// Suffix distinguishing the daemon's signing identifier from the app's.
 public let kHelperIdentifierSuffix = ".privhelper"
@@ -140,6 +147,18 @@ public func daemonCodeRequirement() -> String? {
 
     /// Signal the tunnel down gracefully, waiting for openconnect to run its
     /// own disconnect teardown before escalating.
+    ///
+    /// The `Bool` is sufficient for THIS one operation and the signature is
+    /// deliberately unchanged. `stopTunnel` takes no arguments, performs no
+    /// validation and has no guard refusal, so `false` has exactly one meaning:
+    /// "the daemon found something and did not stop it" — a stuck process, or a
+    /// live one it could not establish as ours and therefore refused to signal.
+    /// The client maps it to `PrivilegedOutcome.failed`, on which the app keeps
+    /// its endpoint record and falls through to the sudo transport.
+    ///
+    /// `kPrivilegedProtocolVersion` therefore stays 2. A bump would make
+    /// `PrivilegedClient.isUsable()` reject the daemon currently installed and
+    /// running, silently dropping the app to the sudo transport until a reinstall.
     func stopTunnel(reply: @escaping (Bool, String) -> Void)
 
     /// Whether a tunnel process is alive, and its pid.
@@ -147,8 +166,27 @@ public func daemonCodeRequirement() -> String? {
 
     /// Put the physical default route back after a failed tunnel left it
     /// pointing at a dead utun.
-    func restoreDefaultRoute(gateway: String, interface: String,
-                             reply: @escaping (Bool, String) -> Void)
+    ///
+    /// Takes the TARGET INTERFACE ONLY: the next hop is derived daemon-side and must
+    /// pass `evaluateDefaultGateway`, so no caller — however well authenticated — can
+    /// make this daemon install a gateway of its choosing. That was the headline bug:
+    /// a literal address captured on one network and replayed on another blackholes
+    /// the machine.
+    func restoreDefaultRoute(interface: String, reply: @escaping (Bool, String) -> Void)
+
+    /// Sweep leftover VPN routing/DNS state and re-install a usable physical default.
+    ///
+    /// Takes no data: every address, route and key it acts on is derived
+    /// privileged-side from the live system. `dryRun` plans and reports without
+    /// executing anything — it is the only way to exercise the real daemon path on a
+    /// machine that must not be mutated, which is why it exists at all.
+    ///
+    /// `dryRun: Bool` is bounded by its own type, so there is nothing to validate here.
+    /// That is the point worth stating: this operation accepts no strings, no paths,
+    /// no addresses and no route lists whatsoever.
+    ///
+    /// A no-op unless NO tunnel pid is alive.
+    func reconcile(dryRun: Bool, reply: @escaping (Bool, String) -> Void)
 }
 
 // ── Opening a file in a directory someone else can write ─────────────────────
@@ -280,5 +318,18 @@ public enum PrivilegedValidation {
 
     public static func isValidInterface(_ s: String) -> Bool {
         !s.isEmpty && s.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber) }
+    }
+
+    /// `isValidInterface`, plus the two things a target for a default-route
+    /// INSTALL must additionally satisfy: a length the kernel can hold
+    /// (IFNAMSIZ - 1), and not being a tunnel (FR-1.8 — restoring the physical
+    /// default onto a utun is the failure this change exists to stop).
+    ///
+    /// Strictly additive: `isValidInterface` is unchanged and is still applied
+    /// first everywhere it was before.
+    public static func isRestoreTargetInterface(_ s: String) -> Bool {
+        guard isValidInterface(s), s.utf8.count <= 15 else { return false }
+        for p in ["utun", "ppp", "ipsec", "gif", "stf"] where s.hasPrefix(p) { return false }
+        return true
     }
 }

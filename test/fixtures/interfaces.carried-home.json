@@ -1,0 +1,14 @@
+[
+  { "name": "lo0",     "ipv4s": [{ "ipv4": "127.0.0.1", "prefixLength": 8 }],
+    "isUp": true,  "isLoopback": true,  "isPointToPoint": false },
+  { "name": "gif0",    "ipv4s": [], "isUp": false, "isLoopback": false, "isPointToPoint": true },
+  { "name": "stf0",    "ipv4s": [], "isUp": false, "isLoopback": false, "isPointToPoint": false },
+  { "name": "en1",     "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": false },
+  { "name": "bridge0", "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": false },
+  { "name": "en0",     "ipv4s": [{ "ipv4": "192.168.1.42", "prefixLength": 24 }],
+    "isUp": true,  "isLoopback": false, "isPointToPoint": false },
+  { "name": "awdl0",   "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": false },
+  { "name": "utun0",   "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": true },
+  { "name": "utun1",   "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": true },
+  { "name": "utun2",   "ipv4s": [], "isUp": true,  "isLoopback": false, "isPointToPoint": true }
+]

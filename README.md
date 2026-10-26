@@ -149,6 +149,25 @@ CI builds and tests on every push, unsigned, needing no secrets. Tagging `v*`
 produces a signed, notarized release and updates the tap — see
 [docs/FEATURES.md](docs/FEATURES.md#ci-and-releases) for the secrets that needs.
 
+## When the network goes unusable
+
+```
+sh scripts/anyway-diag.sh
+```
+
+Answers one question in about twenty seconds: **is this AnywayConnect's fault,
+or something else on this machine?** It is read-only, needs no sudo, and never
+hangs, so it is safe to run mid-incident without reading it first. It checks the
+default routes against the same on-link guard the app itself uses, looks for
+leftover VPN routes and tunnel DNS overrides, probes each network layer
+separately, and counts recent errors from the other network extensions
+installed here — then gives one plain verdict, including "cannot tell" when that
+is the honest answer. Everything it collected is saved to
+`/tmp/anyway-diag-<timestamp>/`, redacted so it can be attached to a bug report.
+`--quick` halves the runtime by skipping the log queries; see
+[docs/FEATURES.md](docs/FEATURES.md#diagnosing-a-wedged-network--scriptsanyway-diagsh)
+for what each section means.
+
 ## Compliance note
 
 Keeping your local LAN (or other networks) reachable while connected to a

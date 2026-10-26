@@ -2,10 +2,15 @@ name: CI
 
 # Build and test on every push and pull request.
 #
-# Deliberately needs no secrets, so it runs on forks and pull requests too. With no
-# Developer ID in the keychain, build-app.sh warns and signs ad-hoc; that is a fully
-# valid bundle which simply cannot register the privileged daemon. Everything that can
-# be checked without Apple's involvement is checked here.
+# The `build` matrix deliberately needs no secrets, so it runs on forks and pull
+# requests too. With no Developer ID in the keychain, build-app.sh warns and signs
+# ad-hoc; that is a fully valid bundle which simply cannot register the privileged
+# daemon. Everything that can be checked without Apple's involvement is checked there,
+# and that job alone is the gate.
+#
+# `signed-build` is the exception and is additive: one extra job that does need secrets,
+# producing the one artifact a person can actually install. It is skipped on forks and
+# cannot block a merge, so none of the above changes for a fork contributor.
 
 on:
   push:
@@ -98,3 +103,221 @@ jobs:
           path: AnywayConnect-${{ matrix.runner }}.zip
           if-no-files-found: error
           retention-days: 14
+
+  # An installable build of the branch under review.
+  #
+  # The matrix artifacts above cannot serve this purpose. That job has no secrets, so
+  # build-app.sh falls back to ad-hoc signing, and an ad-hoc bundle cannot register the
+  # privileged daemon through SMAppService and is refused by Gatekeeper on any machine
+  # that did not build it. So the two things CI structurally cannot test — the
+  # privileged daemon, route mutation, and sleep/wake handling — were also the two
+  # things nobody could test by hand, because there was no bundle to install. This job
+  # exists to produce that bundle: signed with the Developer ID, notarized, stapled and
+  # Gatekeeper-checked, exactly as a release is.
+  #
+  # It stops there. No tag, no GitHub release, no cask, no tap — a workflow artifact is
+  # its only output, and HOMEBREW_TAP_DEPLOY_KEY is deliberately never named in this
+  # file, so a pull-request run has no path to the tap at all.
+  signed-build:
+    # macos-15 because release.yml uses macos-15, not because it is the better image —
+    # macos-26 is newer and is what the author runs. A test build has to be made the
+    # same way the release is or it is not the artifact that ships, and on this project
+    # the runner image is not a detail: the menu-image defect fixed in c3d8a22 tracked
+    # the SDK the binary was LINKED AGAINST, not its deployment target. Built against
+    # the macOS 26 SDK, every SF Symbol in the menu was invisible; against the macOS 15
+    # SDK, none were. A test build on the newer image would therefore show behaviour a
+    # released build never shows, and hide behaviour a released build has. Keep this
+    # pinned to whatever release.yml builds on, and change the two together.
+    runs-on: macos-15
+
+    # Fork pull requests get no secrets, by design — so without this the job would
+    # *fail* on every fork PR rather than sit out, and the certificate import would be
+    # the thing that failed. Gated to same-repository pull requests and pushes to main;
+    # anything else, including workflow_dispatch, is cleanly skipped. A fork
+    # contributor still gets the ad-hoc matrix artifacts, which is the right outcome:
+    # the code is built and tested, only the installable copy is withheld.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+
+    # Non-blocking. Notarization is an external Apple service with a queue, and a slow
+    # or rejected submission must never be what stops a merge — the matrix job above is
+    # the gate.
+    #
+    # continue-on-error rather than branch protection, chosen because it lives in the
+    # file rather than in a repository setting that nobody reading this would see. The
+    # cost is that a failure here is reported as a *success* in some UI surfaces (the
+    # run's overall conclusion, the commit status, the PR's checks summary), so a
+    # failed notarization can look like a passing build. Open the job to see it, and
+    # treat "no AnywayConnect-installable artifact on the run" as the real signal.
+    continue-on-error: true
+
+    steps:
+      # Shallow, unlike the matrix job: ANYWAY_VERSION is passed explicitly below, so
+      # build-app.sh never reaches its `git describe` fallback and there are no tags to
+      # fetch. Keeping it shallow is also what guarantees this job cannot influence the
+      # versioning the matrix job is there to exercise.
+      - uses: actions/checkout@v5
+
+      # 0.0.0 as the dotted part so this can never collide with a real version, and a
+      # pre-release suffix naming where it came from so a stray copy is identifiable.
+      # Through build-app.sh's SHORT_VERSION regex — anchored at both ends, dotted
+      # numerics plus an optional "-suffix" — "0.0.0-pr12.34" yields
+      # CFBundleShortVersionString 0.0.0 and CFBundleVersion 0.0.0-pr12.34. That is the
+      # intent: verify-bundle.sh treats a short version of 0.0.0 as information rather
+      # than a failure, the About panel shows the full build string in parentheses
+      # because the two differ, and nothing here looks like a release.
+      - name: Derive the version
+        id: meta
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          if [ -n "${PR_NUMBER:-}" ]; then
+            echo "version=0.0.0-pr${PR_NUMBER}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Same reason as the matrix job: only needed for its vpnc-script, and without it
+      # the bundle would ship with no install source for the script openconnect runs as
+      # root — which verify-bundle.sh would pass over as merely informational.
+      - name: Install openconnect (for vpnc-script)
+        run: brew install openconnect
+
+      # DUPLICATED FROM release.yml, WHICH IS THE SOURCE OF TRUTH. Change both or
+      # neither: every line here is load-bearing and was learned the hard way, and a
+      # divergence would mean the test build and the release build are signed by
+      # different procedures, which is precisely what this job exists to rule out.
+      #
+      # The clean answer is a composite action under .github/actions/ used by both.
+      # Not yet: release.yml was just restructured into two jobs behind an approval
+      # gate and has never been executed by a real release, so this is the wrong moment
+      # to stack a second untested refactor on it. Factor it out once a release has
+      # proved the current release.yml works.
+      #
+      # A dedicated, throwaway keychain. Importing into the login keychain would leave
+      # the key on a shared runner image and require unlocking it, and deleting it
+      # afterwards is what keeps the private key's lifetime equal to the job's.
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # :- so an empty export password is a valid answer rather than a `set -u`
+          # failure. Keychain Access allows exporting a .p12 with no password, and
+          # `security import -P ""` accepts one, so the secret may legitimately be unset.
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "${APPLE_CERT_PASSWORD:-}" -T /usr/bin/codesign -T /usr/bin/security
+          # Without this codesign blocks on a UI prompt for permission to use the key,
+          # and the job hangs until it times out rather than failing.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Put it on the search list so `security find-identity` — which build-app.sh
+          # uses to choose an identity — can see it.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          echo "identities available:"
+          security find-identity -v -p codesigning | sed 's/^/  /'
+
+      - name: Build
+        env:
+          ANYWAY_VERSION: ${{ steps.meta.outputs.version }}
+        run: ./build-app.sh
+
+      # build-app.sh falls back to ad-hoc signing with a warning rather than an error,
+      # so without this an import that silently did nothing would produce exactly the
+      # uninstallable artifact this job was added to replace — and it would be named as
+      # though it were installable.
+      - name: Require a Developer ID signature
+        run: |
+          codesign -dv --verbose=4 AnywayConnect.app 2>&1 \
+            | grep -q "^Authority=Developer ID Application" \
+            || { echo "::error::build did not use a Developer ID identity"; exit 1; }
+
+      # No EXPECT_VERSION here, unlike the release: there is no tag for the bundle to
+      # agree with, and 0.0.0 is the intended short version.
+      - name: Verify bundle invariants
+        run: sh scripts/verify-bundle.sh AnywayConnect.app
+
+      # Not optional for a build meant to be installed. Signing alone gets the daemon
+      # registered on the machine that built it; the stapled notarization ticket is
+      # what lets it open on another machine, offline, without a Gatekeeper refusal.
+      #
+      # Unlike release.yml this does not degrade to "signed but not notarized" when the
+      # API key is absent. A release still has value unnotarized; this artifact has
+      # almost none, so a missing key should fail loudly here. It costs nothing to do
+      # so, because the job cannot block a merge.
+      - name: Notarize and staple
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -eu
+          echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/api.p8"
+          xcrun notarytool store-credentials anyway-notary \
+            --key "$RUNNER_TEMP/api.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --keychain "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/api.p8"
+          # Same script the release and a hand-run notarization use, so none of the
+          # three paths can diverge.
+          ANYWAY_NOTARY_PROFILE=anyway-notary sh scripts/notarize.sh AnywayConnect.app
+
+      # The claim this artifact makes, actually tested. "Notarized Developer ID" is the
+      # string that distinguishes a stapled bundle from a merely signed one, and it is
+      # the difference between an artifact that opens on the author's machine and one
+      # that gets a dialog.
+      - name: Confirm Gatekeeper accepts it
+        run: |
+          spctl -a -vvv --type exec AnywayConnect.app 2>&1 | tee /tmp/spctl.txt
+          grep -q "source=Notarized Developer ID" /tmp/spctl.txt \
+            || { echo "::error::bundle is not seen as notarized"; exit 1; }
+
+      # ditto rather than zip, so the bundle's symlinks and resource forks survive and
+      # the download still verifies.
+      - name: Package
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          ZIP="AnywayConnect-${VERSION}.zip"
+          # notarize.sh re-packages after stapling, so *its* zip is the one carrying the
+          # ticket. Re-packaging from scratch here would be correct too — the ticket is
+          # stapled into the bundle — but reusing it keeps this identical to the release.
+          if [ -f AnywayConnect-notarized.zip ]; then
+            mv AnywayConnect-notarized.zip "$ZIP"
+          else
+            ditto -c -k --sequesterRsrc --keepParent AnywayConnect.app "$ZIP"
+          fi
+          [ -s "$ZIP" ] || { echo "::error::packaging produced no $ZIP"; exit 1; }
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      # Named for what it is, next to two AnywayConnect-macos-* artifacts that are not:
+      # this is the only one of the three that will launch on a machine other than the
+      # runner, and the only one that can register the privileged daemon.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AnywayConnect-installable
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # Not optional. Runs even when something above failed, so a failed run cannot
+      # leave a private key sitting on a shared runner image.
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true

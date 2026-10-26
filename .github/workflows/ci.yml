@@ -824,7 +824,12 @@ jobs:
       - name: Run summary (installable)
         if: success()
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
+          # build_version, the same output the Package step names the zip from, so this
+          # line and the artifact cannot disagree. It was `version` once — an output that
+          # meta never writes — and because `env:` still defined the variable, `set -u`
+          # did not trip: the step succeeded and announced `AnywayConnect-.zip`, an asset
+          # that does not exist, in the one place a reader can learn this job's result.
+          VERSION: ${{ steps.meta.outputs.build_version }}
         run: |
           set -eu
           # shellcheck disable=SC2016

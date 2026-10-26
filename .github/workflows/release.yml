@@ -3,9 +3,16 @@ name: Release
 # Signed, notarized, stapled build attached to a GitHub release, and — behind a manual
 # approval — published to the Homebrew tap.
 #
-# Runs only on a version tag, because unlike CI this needs secrets and Apple's
-# notarization service, and it cannot work on a fork or from a pull request — secrets are
-# not exposed there by design.
+# Runs on a push to main, on a version tag, and on demand. A push to main releases only
+# when the VERSION file's value changed in that push — that is what shipping is now, and
+# the gate job below is where it is decided. A hand-pushed v* tag still works and still
+# gates the tap, which is the escape hatch when main's history has been rewritten or a
+# release has to be made from a commit main has moved past.
+#
+# Either way this needs secrets and Apple's notarization service, so it cannot work on a
+# fork or from a pull request — secrets are not exposed there by design. The
+# release-candidate path lives in ci.yml for exactly that reason: it runs where the
+# pull-request build already runs, and it never comes near this file's tap job.
 #
 # Two jobs rather than one, because the tap push has to wait for a person and a *step*
 # cannot be gated on one. GitHub's only manual gate is an environment protection rule,
@@ -14,10 +21,13 @@ name: Release
 # into kairyu/homebrew-tap — sits behind the `homebrew-tap` environment and its required
 # reviewer.
 #
-# A hyphen in the tag means SemVer pre-release, and that is the whole lever for
-# releasing without releasing: `v1.0.1-rc.1` is built, notarized, Gatekeeper-checked and
-# published here as a prerelease and NEVER reaches the tap or asks anyone to approve
-# anything, while `v1.0.1` stops at the gate until the owner approves.
+# A hyphen in the tag means SemVer pre-release, and it is still what keeps a prerelease
+# out of the tap here: `v1.0.1-rc.1` is built, notarized, Gatekeeper-checked and
+# published as a prerelease and NEVER reaches the tap or asks anyone to approve
+# anything, while `v1.0.1` stops at the gate until the owner approves. It is no longer
+# the *primary* lever, though — release candidates now come from ci.yml, which has no
+# route to the tap at all. This guard is the second line of defence, for a hyphenated
+# tag pushed by hand or re-run through this workflow.
 #
 # Required repository secrets:
 #
@@ -36,14 +46,215 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]   # NEW: a VERSION bump landing on main is what releases
+    tags: ['v*']       # kept: a hand-pushed tag still releases, and still gates the tap
   workflow_dispatch:
+
+# `branches` and `tags` under one `push` are a union, not an intersection: the patterns
+# are evaluated against the ref's name, so a push to refs/heads/main and a push of
+# refs/tags/v1.0.2 each start a run.
 
 permissions:
   contents: write   # to create the release and upload to it
 
+# New with the push-to-main trigger, and `false` emphatically. Every push to main now
+# starts a Release run, so two pushes in quick succession can run two gates at once for
+# the first time — neither of which can duplicate anything (the second's VERSION compares
+# equal to the first's), but serialising them is tidier and free. cancel-in-progress stays
+# FALSE because cancelling a release part-way through notarization is precisely the thing
+# to avoid: ci.yml can afford to cancel a superseded run, a release cannot.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Decides what, if anything, this run releases — and decides it from the VERSION file's
+  # contents, never from a commit message, a pull request title or a label. Those are text
+  # a human types and can get wrong, and a release that fires on a typo'd subject line is
+  # both a false positive and a false negative waiting to happen. The file is the thing
+  # the release is named after, so the file is the input.
+  #
+  # Read-only, on purpose: this job creates no tag and publishes nothing. The single place
+  # in this workflow that mutates anything is one step in `release`, which runs only after
+  # the bundle has passed everything that could refuse it — so a failed build leaves no
+  # tag behind to clean up.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      tag: ${{ steps.decide.outputs.tag }}              # WITH the leading v
+      create_tag: ${{ steps.decide.outputs.create_tag }}
+    steps:
+      # fetch-depth: 0, not 2 and not 1. The base of a push to main is
+      # github.event.before — main's tip BEFORE this push — which sits at depth 2 for a
+      # merge commit and deeper for every other way main can move. "Rebase and merge" is
+      # enabled on this repository and pushes N commits at once, and main is unprotected
+      # so a direct multi-commit push is possible too, so no fixed shallow depth is
+      # correct. Reproduced in a scratch repo: with a three-commit push whose VERSION bump
+      # is the MIDDLE commit, comparing against the tip's first parent reports "unchanged"
+      # and releases nothing, silently, with no red X. .git here is 1.2 MB, so a full
+      # fetch costs seconds in a job that exists to run git plumbing.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # main's tip before this push. Absent or all-zeroes on branch creation.
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          refuse() { echo "::error title=Release refused::$1"; exit 1; }
+
+          # Absence reads as empty; a commit that is not in this clone returns 3 and the
+          # CALLER refuses, because refuse()'s ::error:: would be captured into the
+          # variable by $(...) instead of reaching the run log. See the long comment on
+          # the identical function in ci.yml's version-gate — the two are deliberately the
+          # same, and a divergence would mean the two paths disagree about what "no
+          # VERSION" means.
+          read_version() {
+            git rev-parse --verify --quiet "$1^{commit}" >/dev/null || return 3
+            if git cat-file -e "$1:VERSION" 2>/dev/null; then
+              git show "$1:VERSION"
+            fi
+          }
+          check() {
+            case "$1" in
+              '')        refuse "VERSION is empty." ;;
+              *[!0-9.]*) refuse "VERSION must be dotted integers only — no leading 'v', no '-rc' suffix, no spaces, no CRLF." ;;
+              .*|*.)     refuse "VERSION has a leading or trailing dot: '$1'" ;;
+              *..*)      refuse "VERSION has an empty component: '$1'" ;;
+            esac
+          }
+          # Every no-op exit in this change reports itself on the one surface the design
+          # made authoritative. This one matters most: a human explicitly asked for a
+          # release and is getting nothing, and `release` being skipped means its own
+          # summary step never runs.
+          already_released() {
+            # shellcheck disable=SC2016
+            printf '## Release `%s`\n\n**Nothing to do — already released.** This tag already has a release, so this run rebuilt nothing and published nothing. To retry only the tap push, re-run the `publish-tap` job from the original run.\n' \
+              "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # --- a tag pushed by hand -------------------------------------------------
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+            # The last way VERSION and a tag could drift, closed. A hand-made tag still
+            # works, but it may not disagree with the file everything else is named from.
+            # ${TAG%%-*} is what keeps a hand-made v1.0.2-rc.9 valid while v9.9.9 is
+            # refused. Skipped when VERSION is absent at that commit, which is true of
+            # v1.0.0 and v1.0.1-rc.1 and of every tag made before this change — absence is
+            # not a disagreement.
+            FILE_V=$(read_version "$GITHUB_SHA") \
+              || refuse "commit $GITHUB_SHA is not in this clone, so VERSION cannot be read from it."
+            if [ -n "$FILE_V" ]; then
+              check "$FILE_V"
+              [ "${TAG%%-*}" = "v$FILE_V" ] || refuse \
+                "tag $TAG disagrees with VERSION ($FILE_V). Expected v$FILE_V or v$FILE_V-<suffix>."
+            fi
+            # Idempotency on this path too, and for the same reason it exists below:
+            # without it, a re-run against an already-released tag rebuilds, re-imports the
+            # certificate, re-submits to Apple's notary queue and only THEN fails at
+            # `gh release create` — twenty minutes to reach a failure this answers in two
+            # seconds.
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "::notice title=Already released::$TAG already has a release. Nothing to do — this is a re-run. To retry only the tap push, re-run the publish-tap job from the original run."
+              already_released "$TAG"
+              exit 0
+            fi
+            { echo "release=yes"; echo "tag=$TAG"; echo "create_tag=no"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- workflow_dispatch on a branch ----------------------------------------
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            # Previously this reached the build with ANYWAY_VERSION=main, produced a bundle
+            # whose CFBundleVersion was "main", and was rejected by verify-bundle.sh
+            # through EXPECT_VERSION several minutes later with a message nobody could act
+            # on. Same fail-closed outcome, said earlier and in English.
+            refuse "workflow_dispatch must be run against a v* tag (pick one in the Run workflow dialog). To release from main, push a VERSION bump to main."
+          fi
+
+          # --- push to main ---------------------------------------------------------
+          # github.event.before is main's tip BEFORE this push, which is the only base
+          # that is right for every way main can move. The tip's FIRST parent is right
+          # only when the push carries exactly one commit — a merge commit or a squash
+          # merge. Rebase-and-merge is enabled here and pushes N commits at once, and main
+          # is unprotected so a direct multi-commit push works too; in both cases the tip's
+          # first parent is itself a commit from this same push, so a VERSION bump that is
+          # not in the LAST commit compares equal and releases nothing, silently, with no
+          # red X. Reproduced in a scratch repo, not assumed.
+          BEFORE="$PUSH_BEFORE"
+          case "$BEFORE" in
+            ''|0000000000000000000000000000000000000000)
+              # Branch creation, or a payload with no `before`. Fall back to the first
+              # parent — ambiguous in English, not in git: for a merge commit the first
+              # parent is the branch that was merged INTO, which is main as it was, while
+              # the second is the branch that was merged in. Comparing against the second
+              # would ask "did VERSION change relative to the feature branch", whose answer
+              # is almost always no, so a merge that bumped VERSION would release nothing.
+              # An ordinary single-parent commit has no second field at all, hence the -n
+              # guard.
+              BEFORE=$(git rev-list --parents -n 1 "$GITHUB_SHA" | cut -d' ' -f2)
+              [ -n "$BEFORE" ] || refuse "could not resolve a base commit for $GITHUB_SHA." ;;
+          esac
+          BASE_V=$(read_version "$BEFORE") \
+            || refuse "commit $BEFORE is not in this clone, so VERSION cannot be read from it. If main was force-pushed, release by pushing the v<VERSION> tag by hand instead."
+          HEAD_V=$(read_version "$GITHUB_SHA") \
+            || refuse "commit $GITHUB_SHA is not in this clone, so VERSION cannot be read from it."
+
+          if [ -z "$HEAD_V" ]; then
+            [ -z "$BASE_V" ] || refuse "VERSION was $BASE_V on main and this push deletes it. VERSION is what drives releases; deleting it is never what anyone meant."
+            echo "no VERSION file — nothing to release"
+            exit 0
+          fi
+          check "$HEAD_V"
+          if [ -n "$BASE_V" ] && [ "$BASE_V" = "$HEAD_V" ]; then
+            echo "VERSION unchanged at $HEAD_V — nothing to release"
+            exit 0
+          fi
+          echo "VERSION is $HEAD_V (was ${BASE_V:-absent}) — releasing"
+
+          TAG="v$HEAD_V"
+          # ^{} first, then the plain form: ^{} resolves an annotated tag to its commit and
+          # yields nothing for a lightweight one, so both halves are needed.
+          POINTS=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}' | head -1)
+          [ -n "$POINTS" ] || POINTS=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}' | head -1)
+          CREATE=yes
+          if [ -n "$POINTS" ]; then
+            # The same one-time exemption the rc gate carries, for the same reason: the
+            # push that INTRODUCES the VERSION file names the version this tree already
+            # is, which is normally the one just shipped. Its tag therefore exists, at an
+            # earlier commit, and that is not a stale-VERSION mistake — it is the file
+            # being created. Requires BASE_V to be absent, so it cannot fire twice.
+            if [ "$POINTS" != "$GITHUB_SHA" ] && [ -z "$BASE_V" ]; then
+              echo "::notice title=VERSION introduced at an already-released version::$TAG already exists at $POINTS. This push introduces the VERSION file recording the current version, so there is nothing to release. Bump VERSION to cut the next release."
+              printf '## Release\n\n**Nothing to do.** This push introduces `VERSION` at `%s`, which is already released (`%s` exists at `%s`). No tag was created and nothing was published. Bump `VERSION` to cut the next release.\n' \
+                "$HEAD_V" "$TAG" "$POINTS" >> "$GITHUB_STEP_SUMMARY"
+              { echo "release=no"; echo "create_tag=no"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$POINTS" = "$GITHUB_SHA" ] || refuse \
+              "$TAG already exists on origin at $POINTS. VERSION says $HEAD_V, which has already been released from a different commit — bump VERSION. A tag is never moved."
+            # Exists at THIS commit: a re-run, or an earlier attempt that got as far as the
+            # tag. Do not try to create it again.
+            CREATE=no
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "::notice title=Already released::$TAG exists at this commit and already has a release. Nothing to do. To retry only the tap push, re-run the publish-tap job from that run."
+              already_released "$TAG"
+              exit 0
+            fi
+            echo "$TAG exists at this commit but has no release — an earlier attempt stopped partway; continuing"
+          fi
+          { echo "release=yes"; echo "tag=$TAG"; echo "create_tag=$CREATE"; } >> "$GITHUB_OUTPUT"
+
   release:
+    needs: gate
+    if: needs.gate.outputs.release == 'yes'
     runs-on: macos-15
 
     # What publish-tap needs in order to decide whether to run at all, and what to name
@@ -51,16 +262,23 @@ jobs:
     # notarized" and "what version is this" are each answered in exactly one place.
     outputs:
       notarized: ${{ steps.notarize.outputs.notarized }}
-      version: ${{ steps.meta.outputs.version }}
+      version: ${{ steps.meta.outputs.version }}   # the tag WITHOUT its leading v
 
     steps:
       - uses: actions/checkout@v5
 
+      # The tag is now an input from the gate rather than the ref that started the run:
+      # a VERSION bump arrives as a push to main, where GITHUB_REF_NAME is "main". TAG
+      # also goes into GITHUB_ENV so the long shell steps below read $TAG instead of
+      # $GITHUB_REF_NAME, which is what keeps this change a rename rather than a rewrite.
       - name: Derive the version
         id: meta
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
         run: |
           set -eu
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install openconnect (for vpnc-script)
         run: brew install openconnect
@@ -99,12 +317,14 @@ jobs:
           echo "identities available:"
           security find-identity -v -p codesigning | sed 's/^/  /'
 
-      # Passed explicitly rather than left to build-app.sh's git fallback: a
-      # tag-triggered checkout is shallow and need not have fetched the tag object, so
-      # `git describe` cannot be relied on here.
+      # Passed explicitly rather than left to build-app.sh's git fallback, and on the
+      # VERSION-driven path the fallback could not possibly be right: this build happens
+      # BEFORE the tag is created, so `git describe` would name the previous release. On
+      # a tag-triggered run the checkout is also shallow and need not have fetched the
+      # tag object. The gate's tag is the only version this job will accept.
       - name: Build
         env:
-          ANYWAY_VERSION: ${{ github.ref_name }}
+          ANYWAY_VERSION: ${{ needs.gate.outputs.tag }}
         run: ./build-app.sh
 
       # Fails the release if the build fell back to ad-hoc signing. Without this the job
@@ -120,7 +340,7 @@ jobs:
       # version, so a release can never ship a bundle that disagrees with its own name.
       - name: Verify bundle invariants
         env:
-          EXPECT_VERSION: ${{ github.ref_name }}
+          EXPECT_VERSION: ${{ needs.gate.outputs.tag }}
         run: sh scripts/verify-bundle.sh AnywayConnect.app
 
       - name: Test connect flow
@@ -175,12 +395,69 @@ jobs:
           grep -q "source=Notarized Developer ID" /tmp/spctl.txt \
             || { echo "::error::bundle is not seen as notarized"; exit 1; }
 
+      # The annotated tag, created only now — after the bundle has been built, signed,
+      # Developer-ID-checked, asserted against EXPECT_VERSION, connect-tested, notarized,
+      # stapled and accepted by Gatekeeper. Everything that could refuse this release has
+      # already had its chance, so a tag only ever appears on a commit that produced a
+      # releasable bundle, and a failed build leaves nothing to clean up.
+      #
+      # Annotated rather than lightweight: the tag object records who made it and when,
+      # and `git describe` in a local build then has a real tag to describe.
+      #
+      # Gated on NOTARIZED as well as on create_tag, and that second condition is not
+      # decoration. On the VERSION-driven path the tag IS the version number, so spending
+      # it on a build Gatekeeper refuses burns it: the gate's already-released exit would
+      # then decline to rebuild at the same commit, and recovery would mean deleting a
+      # public release and tag by hand — which no workflow here is allowed to do — or
+      # bumping VERSION again and leaving v<VERSION> permanently occupied by an
+      # uninstallable build. App Store Connect keys expire, so this is not hypothetical.
+      # The release and the tag stand or fall together; the step below is the other half.
+      # The existing degrade-to-signed-but-not-notarized behaviour is kept for a
+      # HAND-PUSHED tag, where a human chose the name and can choose again.
+      #
+      # Never --force, and never a ref the gate did not clear. create_tag is 'no' both for
+      # a tag pushed by hand and for one a previous attempt already pushed at this same
+      # commit, and the gate has already refused the case where it exists somewhere else.
+      # Tags have been moved by hand in this repository five times (v1.0.0 across three
+      # commits, v1.0.1-rc.1 across two); no workflow here can — `git push origin
+      # refs/tags/<existing>` is rejected with "already exists" and there is no --force
+      # anywhere in this file.
+      #
+      # This push cannot start another run of this workflow: "events triggered by the
+      # GITHUB_TOKEN will not create a new workflow run", with push not among the
+      # documented exceptions. That is the documented behaviour this whole design is built
+      # around rather than fighting.
+      - name: Create the annotated tag
+        if: needs.gate.outputs.create_tag == 'yes' && env.NOTARIZED == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "anyway-connect $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
+      # The other half of the pairing above: without this, an unnotarized VERSION-driven
+      # run would carry on and publish a release for a tag that was never created, which
+      # `--verify-tag` would refuse anyway — late, and with a message about tags rather
+      # than about the notary key. Failing here leaves the version number unspent and
+      # still available to retry.
+      - name: Refuse an unnotarized VERSION-driven release
+        if: needs.gate.outputs.create_tag == 'yes' && env.NOTARIZED != 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          echo "::error title=Release refused::VERSION says $VERSION, but this build is not notarized, so no $TAG tag was created and nothing was published. Set APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID and re-run: VERSION is still unreleased, so the same value is still available."
+          exit 1
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          ZIP="AnywayConnect-${GITHUB_REF_NAME}.zip"
+          ZIP="AnywayConnect-${TAG}.zip"
           # notarize.sh re-packages after stapling, so that zip carries the ticket. When
           # notarization was skipped it does not exist and the bundle is packaged here
           # instead — with ditto either way, since the signature covers symlinks.
@@ -202,13 +479,19 @@ jobs:
             # :github_latest livecheck ignores prereleases, which is what stops a release
             # candidate becoming the version a cask resolves to. publish-tap refuses
             # hyphenated tags for the same reason, from the other direction.
-            case "$GITHUB_REF_NAME" in
+            case "$TAG" in
               *-*) PRERELEASE=yes ;;
               *)   PRERELEASE= ;;
             esac
-            gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
-              --title "$GITHUB_REF_NAME" \
+            # --verify-tag is new, and it is a guard rather than a rename: the tag has
+            # already been created by the step above, and without this a failed tag push
+            # would let gh quietly create a lightweight tag at the DEFAULT BRANCH TIP
+            # instead — which on a main push happens to be the right commit by luck, and
+            # on nothing else.
+            gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+              --title "$TAG" \
               --generate-notes \
+              --verify-tag \
               ${PRERELEASE:+--prerelease}
             exit 0
           fi
@@ -225,9 +508,10 @@ jobs:
           > To produce a notarized release, set `APPLE_API_KEY`, `APPLE_API_KEY_ID` and
           > `APPLE_API_ISSUER_ID` and tag again.
           NOTES
-          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
-            --title "$GITHUB_REF_NAME (unnotarized)" \
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+            --title "$TAG (unnotarized)" \
             --prerelease \
+            --verify-tag \
             --notes-file /tmp/notes.md
 
       # The cask is rendered from the same script used by hand, and attached to the
@@ -248,14 +532,88 @@ jobs:
           set -eu
           SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
           sh scripts/make-cask.sh "$VERSION" "$SHA" > anyway-connect.rb
+          # Checked for the same reason the zip is: the redirect truncates the file before
+          # the script runs, so a failure after that point leaves a zero-byte cask that
+          # would upload under the right name and be published to the tap as an empty
+          # file.
+          [ -s anyway-connect.rb ] || { echo "::error::make-cask.sh produced no cask"; exit 1; }
           echo "--- rendered cask ---"; cat anyway-connect.rb
-          gh release upload "$GITHUB_REF_NAME" anyway-connect.rb
+          gh release upload "$TAG" anyway-connect.rb
 
       # Runs even when something above failed, so a failed release does not leave a
       # private key sitting on the runner.
       - name: Remove the keychain
         if: always()
         run: security delete-keychain "$KEYCHAIN" || true
+
+      # What this run published, and the one question the approval gate exists to
+      # answer: is the tap going to change? Without this, both have to be reconstructed
+      # from three step logs and a job's `if:` expression.
+      #
+      # if: always(), because a release that died at notarization still has to say what
+      # it was trying to do — a skipped summary is worse than a terse one. `gh release
+      # view` is allowed to fail for the same reason: on a failed release there is
+      # nothing to view.
+      #
+      # Writing to $GITHUB_STEP_SUMMARY is a file write on the runner and needs no token
+      # scope, which is what lets publish-tap report below while keeping
+      # `permissions: contents: read`.
+      - name: Run summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The gate's tag, not github.ref_name: on a VERSION-driven release the ref is
+          # `main`, which is not what was published.
+          TAG: ${{ needs.gate.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # Every printf below is a single-quoted Markdown format string, and Markdown
+          # uses backticks for code spans. shellcheck reads those as a command
+          # substitution it cannot see into (SC2016) and suggests double quotes — which
+          # would turn them into a real command substitution. They are literal; the
+          # single quotes are the point.
+          # shellcheck disable=SC2016
+          {
+            printf '## Release `%s`\n\n' "$TAG"
+            if [ -z "${ZIP:-}" ]; then
+              printf ':rotating_light: This run did not reach packaging. **No release was created.**\n\n'
+            else
+              URL=$(gh release view "$TAG" --json url --jq .url 2>/dev/null || echo '(not created)')
+              case "$TAG" in *-*) PRE=yes ;; *) PRE=no ;; esac
+              ASSETS="\`$ZIP\`, \`$ZIP.sha256\`"
+              # An explicit `if` rather than `[ … ] && ASSETS=…`: under `set -e` a failing
+              # test at the end of an `&&` list is a command with status 1 and would abort
+              # this whole block — the kind of thing that works until the day the flag is
+              # false.
+              if [ "${NOTARIZED:-false}" = true ]; then
+                ASSETS="$ASSETS, \`anyway-connect.rb\`"
+              fi
+              printf '| | |\n|---|---|\n'
+              printf '| Release | %s |\n' "$URL"
+              printf '| Tag | `%s` |\n' "$TAG"
+              printf '| Prerelease | %s |\n' "$PRE"
+              printf '| Notarized | %s |\n' "${NOTARIZED:-false}"
+              printf '| Assets | %s |\n' "$ASSETS"
+              printf '| zip sha256 | `%s` |\n\n' "$(cut -d' ' -f1 "$ZIP.sha256" 2>/dev/null || echo unknown)"
+            fi
+            # One line, plainly, on whether the tap will be updated. There is no deep link
+            # to the approval dialog — the "Review deployments" button lives on the run
+            # page — so the run page is what gets linked.
+            if [ "${NOTARIZED:-false}" != true ]; then
+              printf '**Homebrew tap: will not be updated.** This build is not notarized, so `publish-tap` is skipped and nobody is asked to approve anything.\n'
+            else
+              case "$TAG" in
+                *-*) printf '**Homebrew tap: will not be updated.** `%s` is a prerelease — skipped by design, and no approval is requested.\n' "$TAG" ;;
+                *)   printf '**Homebrew tap: awaiting approval.** `publish-tap` is waiting on a required reviewer. Approve it on [the run page](%s); nothing reaches `kairyu/homebrew-tap` until you do.\n' "$RUN_URL"
+                     # The terminal case, which nothing else would ever contradict:
+                     # publish-tap writes its own summary line when it runs, but a REJECTED
+                     # or expired deployment never runs it, so this line would otherwise
+                     # stand as the last word on a run where nothing happened.
+                     printf '\nIf this summary still says *awaiting approval* and the run has finished, the deployment was rejected or it expired, and nothing reached the tap.\n' ;;
+              esac
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The manual gate. Everything above has already happened and is already public by the
   # time this is asked for; all that waits here is the copy into the tap, which is the
@@ -273,7 +631,13 @@ jobs:
     # Evaluated before the environment's protection rule, so a tag that fails these is
     # skipped outright and nobody is ever asked to approve a deployment that would do
     # nothing. That is what makes `v1.0.1-rc.1` a silent, no-prompt release.
-    if: needs.release.outputs.notarized == 'true' && !contains(github.ref_name, '-')
+    #
+    # The hyphen test moved from github.ref_name to the release's own version output,
+    # because on a VERSION-driven release the ref is `main` and contains no hyphen —
+    # which would have passed this guard by accident rather than by reasoning. The
+    # version output is the tag minus its leading `v`, so a SemVer pre-release suffix is
+    # detected identically and the `v` cannot contribute a false negative.
+    if: needs.release.outputs.notarized == 'true' && !contains(needs.release.outputs.version, '-')
     runs-on: ubuntu-latest
     # Required reviewers on this environment are the whole mechanism: the job reaches
     # "Waiting" and stays there until a reviewer approves it in the run's page.
@@ -296,19 +660,45 @@ jobs:
       - name: Update the Homebrew tap
         env:
           GH_TOKEN: ${{ github.token }}
+          # Required, not decorative. This job deliberately has no actions/checkout — it
+          # needs nothing from this repository's tree, only one asset from the release —
+          # so there is no git repository for `gh` to infer the target repo from, and the
+          # very first `gh` call dies with the distinctly unhelpful
+          #
+          #     failed to run git: fatal: not a git repository
+          #
+          # That is exactly how the v1.0.1 tap push failed on its first ever execution:
+          # the release was built, notarized, published and approved, and this job then
+          # fell over before its first useful command. GH_REPO states the repository
+          # explicitly, which is the supported way to run `gh` outside a checkout.
+          GH_REPO: ${{ github.repository }}
           TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_REPO: kairyu/homebrew-tap
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -eu
+          # The summary printfs here are single-quoted Markdown, and Markdown's code
+          # spans are backticks — which shellcheck reads as command substitution
+          # (SC2016) and would have us "fix" by using double quotes, turning literal
+          # text into a real substitution. Disabled at each of the three sites.
+          # shellcheck disable=SC2016
           if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
             echo "::notice::HOMEBREW_TAP_DEPLOY_KEY not set — cask attached to the release but tap not updated"
+            # Every "did nothing" exit from this step writes its own summary line. All
+            # three exits live inside one `run:` block, so a trailing step could not tell
+            # which one was taken — and "the tap was not updated" is exactly the fact the
+            # run page otherwise reports as an unqualified green tick.
+            printf '### Homebrew tap\n\n**Not updated** — `HOMEBREW_TAP_DEPLOY_KEY` is not set. Nothing is lost: the cask is attached to the release as `anyway-connect.rb`. Copy it into `%s` by hand, or set the secret and re-run this job.\n' \
+              "$TAP_REPO" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           # The asset the release job attached, not a re-render: whatever is published on
           # the release is byte-for-byte what lands in the tap.
-          gh release download "$GITHUB_REF_NAME" --pattern anyway-connect.rb
+          # "v${VERSION}" rather than $GITHUB_REF_NAME, which on a VERSION-driven release
+          # is `main`. VERSION is already in this step's env: it is the tag without its
+          # leading v, so putting the v back reconstructs the tag exactly.
+          gh release download "v${VERSION}" --pattern anyway-connect.rb
           echo "--- cask from the release ---"; cat anyway-connect.rb
 
           KEYFILE="$RUNNER_TEMP/tap_deploy_key"
@@ -322,7 +712,19 @@ jobs:
           # GH_TOKEN. An anonymous request to api.github.com from a runner shares a
           # heavily used IP pool and comes back 403 on rate limit — which it did.
           KNOWN="$RUNNER_TEMP/known_hosts"
-          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' > "$KNOWN"
+          # Captured and status-checked rather than piped straight to the file. `gh api`
+          # writes its HTTP error body to STDOUT, so a failed call piped into sed would
+          # have written `github.com {"message":"Bad credentials",…}` into known_hosts —
+          # a non-empty file, which satisfied the `-s` guard below and left the real
+          # failure to surface later as an unintelligible host-key mismatch on the clone.
+          # In a pipeline `set -e` could not catch it either, because a pipeline takes its
+          # status from the last command and sed succeeded. An assignment does not have
+          # that problem, and the explicit `||` says what went wrong where it went wrong.
+          # Same defect class as the rc tag probe in ci.yml; this one merely failed in a
+          # more confusing place rather than a more dangerous one.
+          KEYS=$(gh api meta --jq '.ssh_keys[]') \
+            || { echo "::error::could not fetch GitHub host keys"; exit 1; }
+          printf '%s\n' "$KEYS" | sed 's/^/github.com /' > "$KNOWN"
           [ -s "$KNOWN" ] || { echo "::error::could not fetch GitHub host keys"; exit 1; }
 
           export GIT_SSH_COMMAND="ssh -i $KEYFILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN"
@@ -334,7 +736,38 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/anyway-connect.rb
           # Nothing to do when re-running a tag against an unchanged cask.
-          git diff --cached --quiet && { echo "cask already current"; exit 0; }
+          #
+          # A plain `if` rather than the `git diff --cached --quiet && { … }` this used to
+          # be: the summary line makes the body multi-statement, and the `&&` form would
+          # then hide a real failure of `git commit` behind a short-circuit.
+          # shellcheck disable=SC2016
+          if git diff --cached --quiet; then
+            echo "cask already current"
+            printf '### Homebrew tap\n\n**No commit** — `Casks/anyway-connect.rb` in `%s` is already byte-identical to the cask on this release. This is what a re-run of an already-published version looks like.\n' \
+              "$TAP_REPO" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git commit -m "anyway-connect ${VERSION}"
           git push
+          # shellcheck disable=SC2016
+          printf '### Homebrew tap\n\n**Pushed anyway-connect %s** — %s/%s/commit/%s\n\n`brew upgrade --cask anyway-connect` now offers this version.\n' \
+            "$VERSION" "$GITHUB_SERVER_URL" "$TAP_REPO" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           rm -f "$KEYFILE"
+
+      # The fourth outcome. The three exits above each report themselves, but a red exit
+      # at `gh release download` or at `gh api meta` — the host-key fetch, which has a
+      # recorded 403 on a runner's shared IP pool — would write nothing at all, leaving
+      # the release job's "awaiting approval" line as the last word on a run where the
+      # approval was in fact given and then failed.
+      - name: Run summary (tap push failed)
+        if: failure()
+        env:
+          TAP_REPO: kairyu/homebrew-tap
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # Literal Markdown backticks in a single-quoted format string; see the note in
+          # the step above.
+          # shellcheck disable=SC2016
+          printf '### Homebrew tap\n\n:rotating_light: **Not updated — this job failed after the approval was given.** `%s` is unchanged and `brew upgrade` still offers the previous version. The release itself is published and carries the cask as `anyway-connect.rb`. See [the step log](%s); re-running just this job is safe, because the cask is downloaded from the release rather than re-rendered.\n' \
+            "$TAP_REPO" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"

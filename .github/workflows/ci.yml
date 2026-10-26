@@ -854,7 +854,7 @@ jobs:
               yes:published)
                 printf -- '- **`%s`** — %s\n' "$RC_TAG" "${RC_URL:-}"
                 printf -- '- zip sha256 `%s`\n' "${RC_SHA256:-unknown}"
-                printf -- '- **Homebrew tap: not touched.** A prerelease is excluded by design, no approval was requested, and `HOMEBREW_TAP_DEPLOY_KEY` is not named anywhere in this workflow.\n' ;;
+                printf -- '- **Homebrew tap: not touched.** A prerelease is excluded by Homebrew'"'"'s `:github_latest` livecheck, no approval was requested, and no job in this workflow holds the tap'"'"'s deploy key or declares an `environment`.\n' ;;
               yes:already-published)
                 printf -- '- **`%s`** — %s\n- Already existed at this commit; this was a re-run and nothing was created twice.\n' "$RC_TAG" "${RC_URL:-}" ;;
               yes:withdrawn)

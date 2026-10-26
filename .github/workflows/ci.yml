@@ -23,9 +23,16 @@ concurrency:
 
 jobs:
   build:
-    # Both are worth covering: the app's deployment target is macOS 13, so building on
+    # Both are worth covering: the app's deployment target is macOS 14, so building on
     # the older image is what catches use of an API newer than that target, while the
     # newer image is what the author actually runs.
+    #
+    # The older image earns its place twice over now. The menu-image bug fixed in
+    # "stop the menu telling the user things that are not true" was invisible to a
+    # bisect because it tracked the SDK the binary was LINKED AGAINST, not its
+    # deployment target: builds made against the macOS 26 SDK hid every SF Symbol in
+    # the menu, while the CI-built v1.0.0 (SDK 15) did not. Two images, two SDKs, is
+    # what would have caught that from the other side.
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +68,21 @@ jobs:
 
       - name: Test connect flow
         run: sh test/test-connect-flow.sh
+      # The pure decision layer: the on-link guard, the reconcile planner, the tunnel
+      # scope and the install-target ladder, driven entirely from checked-in fixtures
+      # and forbidden by its own gates from reading live system state.
+      #
+      # Worth more than its case count suggests. It also re-derives every expected
+      # route list from the fixture text rather than trusting a checked-in answer, so
+      # a run here re-checks the derivation itself — which is the only thing standing
+      # between these suites and a test that asserts whatever the code happens to do.
+      - name: Test decision layer (Swift harness)
+        run: sh test/run-swift-harness.sh
+      # The same on-link guard, ported to shell for the sudo fallback transport. Both
+      # must reach identical verdicts with identical reasons: a divergence means one
+      # privileged path would install a default route the other would refuse.
+      - name: Test on-link guard parity (shell)
+        run: sh test/test-onlink-guard.sh
 
       # ditto rather than zip, to preserve the bundle's symlinks and resource forks.
       # actions/upload-artifact would otherwise flatten the signature and the download

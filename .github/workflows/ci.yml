@@ -149,8 +149,10 @@ jobs:
     # file rather than in a repository setting that nobody reading this would see. The
     # cost is that a failure here is reported as a *success* in some UI surfaces (the
     # run's overall conclusion, the commit status, the PR's checks summary), so a
-    # failed notarization can look like a passing build. Open the job to see it, and
-    # treat "no AnywayConnect-installable artifact on the run" as the real signal.
+    # failed notarization can look like a passing build. The run summary is the
+    # mitigation: this job writes a :rotating_light: banner into it on failure, under
+    # `if: failure()`, which is the one surface on the run that says so. "No
+    # AnywayConnect-installable artifact" remains the corroborating signal.
     continue-on-error: true
 
     steps:
@@ -321,3 +323,41 @@ jobs:
       - name: Remove the keychain
         if: always()
         run: security delete-keychain "$KEYCHAIN" || true
+
+      # continue-on-error: true means a failure in this job is reported as SUCCESS by the
+      # run conclusion, the commit status and the pull request's checks summary. That was
+      # a deliberate trade — notarization is an Apple queue and must not block a merge —
+      # and the recorded cost was "a failed notarization can look like a passing build".
+      # This step is the mitigation, so it must not itself depend on how this job's result
+      # is reported upward: `failure()` is documented as "returns true when any previous
+      # step of a job fails", which is exactly the question being asked. `job.status`
+      # inside a continue-on-error job is not, and this banner is the only surface that
+      # would reveal it was wrong.
+      - name: Run summary (failed)
+        if: failure()
+        run: |
+          set -eu
+          # Single-quoted Markdown format strings, whose backticks are code spans rather
+          # than command substitution. shellcheck's SC2016 suggestion — use double quotes
+          # — would make them real substitutions.
+          # shellcheck disable=SC2016
+          {
+            printf '## :rotating_light: `signed-build` FAILED — the rest of this run is telling you otherwise\n\n'
+            printf 'This job carries `continue-on-error: true`, so the run conclusion, the commit status and the PR checks summary all report **success**. Nothing else on this page will say what you are reading here.\n\n'
+            printf -- '- There is **no installable build** of this branch. `AnywayConnect-macos-15` and `AnywayConnect-macos-26` are ad-hoc signed: they will not launch on another machine and cannot register the privileged daemon.\n\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # if: success() is what a step does by default; it is spelled out because its
+      # partner above is spelled out, and a reader comparing the two should not have to
+      # know that.
+      - name: Run summary (installable)
+        if: success()
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          # shellcheck disable=SC2016
+          {
+            printf '### Installable build\n\n'
+            printf -- '- **`AnywayConnect-installable`** — `AnywayConnect-%s.zip`. The **only** artifact on this run that will launch on a machine other than the runner, and the only one that can register the privileged daemon: Developer ID signed, notarized, stapled. The two `AnywayConnect-macos-*` artifacts are ad-hoc signed and will do neither.\n\n' "$VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

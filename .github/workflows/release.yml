@@ -257,6 +257,73 @@ jobs:
         if: always()
         run: security delete-keychain "$KEYCHAIN" || true
 
+      # What this run published, and the one question the approval gate exists to
+      # answer: is the tap going to change? Without this, both have to be reconstructed
+      # from three step logs and a job's `if:` expression.
+      #
+      # if: always(), because a release that died at notarization still has to say what
+      # it was trying to do — a skipped summary is worse than a terse one. `gh release
+      # view` is allowed to fail for the same reason: on a failed release there is
+      # nothing to view.
+      #
+      # Writing to $GITHUB_STEP_SUMMARY is a file write on the runner and needs no token
+      # scope, which is what lets publish-tap report below while keeping
+      # `permissions: contents: read`.
+      - name: Run summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # Every printf below is a single-quoted Markdown format string, and Markdown
+          # uses backticks for code spans. shellcheck reads those as a command
+          # substitution it cannot see into (SC2016) and suggests double quotes — which
+          # would turn them into a real command substitution. They are literal; the
+          # single quotes are the point.
+          # shellcheck disable=SC2016
+          {
+            printf '## Release `%s`\n\n' "$TAG"
+            if [ -z "${ZIP:-}" ]; then
+              printf ':rotating_light: This run did not reach packaging. **No release was created.**\n\n'
+            else
+              URL=$(gh release view "$TAG" --json url --jq .url 2>/dev/null || echo '(not created)')
+              case "$TAG" in *-*) PRE=yes ;; *) PRE=no ;; esac
+              ASSETS="\`$ZIP\`, \`$ZIP.sha256\`"
+              # An explicit `if` rather than `[ … ] && ASSETS=…`: under `set -e` a failing
+              # test at the end of an `&&` list is a command with status 1 and would abort
+              # this whole block — the kind of thing that works until the day the flag is
+              # false.
+              if [ "${NOTARIZED:-false}" = true ]; then
+                ASSETS="$ASSETS, \`anyway-connect.rb\`"
+              fi
+              printf '| | |\n|---|---|\n'
+              printf '| Release | %s |\n' "$URL"
+              printf '| Tag | `%s` |\n' "$TAG"
+              printf '| Prerelease | %s |\n' "$PRE"
+              printf '| Notarized | %s |\n' "${NOTARIZED:-false}"
+              printf '| Assets | %s |\n' "$ASSETS"
+              printf '| zip sha256 | `%s` |\n\n' "$(cut -d' ' -f1 "$ZIP.sha256" 2>/dev/null || echo unknown)"
+            fi
+            # One line, plainly, on whether the tap will be updated. There is no deep link
+            # to the approval dialog — the "Review deployments" button lives on the run
+            # page — so the run page is what gets linked.
+            if [ "${NOTARIZED:-false}" != true ]; then
+              printf '**Homebrew tap: will not be updated.** This build is not notarized, so `publish-tap` is skipped and nobody is asked to approve anything.\n'
+            else
+              case "$TAG" in
+                *-*) printf '**Homebrew tap: will not be updated.** `%s` is a prerelease — skipped by design, and no approval is requested.\n' "$TAG" ;;
+                *)   printf '**Homebrew tap: awaiting approval.** `publish-tap` is waiting on a required reviewer. Approve it on [the run page](%s); nothing reaches `kairyu/homebrew-tap` until you do.\n' "$RUN_URL"
+                     # The terminal case, which nothing else would ever contradict:
+                     # publish-tap writes its own summary line when it runs, but a REJECTED
+                     # or expired deployment never runs it, so this line would otherwise
+                     # stand as the last word on a run where nothing happened.
+                     printf '\nIf this summary still says *awaiting approval* and the run has finished, the deployment was rejected or it expired, and nothing reached the tap.\n' ;;
+              esac
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # The manual gate. Everything above has already happened and is already public by the
   # time this is asked for; all that waits here is the copy into the tap, which is the
   # only part that changes what `brew upgrade` gives other people.
@@ -301,8 +368,19 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -eu
+          # The summary printfs here are single-quoted Markdown, and Markdown's code
+          # spans are backticks — which shellcheck reads as command substitution
+          # (SC2016) and would have us "fix" by using double quotes, turning literal
+          # text into a real substitution. Disabled at each of the three sites.
+          # shellcheck disable=SC2016
           if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
             echo "::notice::HOMEBREW_TAP_DEPLOY_KEY not set — cask attached to the release but tap not updated"
+            # Every "did nothing" exit from this step writes its own summary line. All
+            # three exits live inside one `run:` block, so a trailing step could not tell
+            # which one was taken — and "the tap was not updated" is exactly the fact the
+            # run page otherwise reports as an unqualified green tick.
+            printf '### Homebrew tap\n\n**Not updated** — `HOMEBREW_TAP_DEPLOY_KEY` is not set. Nothing is lost: the cask is attached to the release as `anyway-connect.rb`. Copy it into `%s` by hand, or set the secret and re-run this job.\n' \
+              "$TAP_REPO" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -334,7 +412,38 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/anyway-connect.rb
           # Nothing to do when re-running a tag against an unchanged cask.
-          git diff --cached --quiet && { echo "cask already current"; exit 0; }
+          #
+          # A plain `if` rather than the `git diff --cached --quiet && { … }` this used to
+          # be: the summary line makes the body multi-statement, and the `&&` form would
+          # then hide a real failure of `git commit` behind a short-circuit.
+          # shellcheck disable=SC2016
+          if git diff --cached --quiet; then
+            echo "cask already current"
+            printf '### Homebrew tap\n\n**No commit** — `Casks/anyway-connect.rb` in `%s` is already byte-identical to the cask on this release. This is what a re-run of an already-published version looks like.\n' \
+              "$TAP_REPO" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git commit -m "anyway-connect ${VERSION}"
           git push
+          # shellcheck disable=SC2016
+          printf '### Homebrew tap\n\n**Pushed anyway-connect %s** — %s/%s/commit/%s\n\n`brew upgrade --cask anyway-connect` now offers this version.\n' \
+            "$VERSION" "$GITHUB_SERVER_URL" "$TAP_REPO" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           rm -f "$KEYFILE"
+
+      # The fourth outcome. The three exits above each report themselves, but a red exit
+      # at `gh release download` or at `gh api meta` — the host-key fetch, which has a
+      # recorded 403 on a runner's shared IP pool — would write nothing at all, leaving
+      # the release job's "awaiting approval" line as the last word on a run where the
+      # approval was in fact given and then failed.
+      - name: Run summary (tap push failed)
+        if: failure()
+        env:
+          TAP_REPO: kairyu/homebrew-tap
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # Literal Markdown backticks in a single-quoted format string; see the note in
+          # the step above.
+          # shellcheck disable=SC2016
+          printf '### Homebrew tap\n\n:rotating_light: **Not updated — this job failed after the approval was given.** `%s` is unchanged and `brew upgrade` still offers the previous version. The release itself is published and carries the cask as `anyway-connect.rb`. See [the step log](%s); re-running just this job is safe, because the cask is downloaded from the release rather than re-rendered.\n' \
+            "$TAP_REPO" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"

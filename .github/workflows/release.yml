@@ -688,7 +688,19 @@ jobs:
           # GH_TOKEN. An anonymous request to api.github.com from a runner shares a
           # heavily used IP pool and comes back 403 on rate limit — which it did.
           KNOWN="$RUNNER_TEMP/known_hosts"
-          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' > "$KNOWN"
+          # Captured and status-checked rather than piped straight to the file. `gh api`
+          # writes its HTTP error body to STDOUT, so a failed call piped into sed would
+          # have written `github.com {"message":"Bad credentials",…}` into known_hosts —
+          # a non-empty file, which satisfied the `-s` guard below and left the real
+          # failure to surface later as an unintelligible host-key mismatch on the clone.
+          # In a pipeline `set -e` could not catch it either, because a pipeline takes its
+          # status from the last command and sed succeeded. An assignment does not have
+          # that problem, and the explicit `||` says what went wrong where it went wrong.
+          # Same defect class as the rc tag probe in ci.yml; this one merely failed in a
+          # more confusing place rather than a more dangerous one.
+          KEYS=$(gh api meta --jq '.ssh_keys[]') \
+            || { echo "::error::could not fetch GitHub host keys"; exit 1; }
+          printf '%s\n' "$KEYS" | sed 's/^/github.com /' > "$KNOWN"
           [ -s "$KNOWN" ] || { echo "::error::could not fetch GitHub host keys"; exit 1; }
 
           export GIT_SSH_COMMAND="ssh -i $KEYFILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN"

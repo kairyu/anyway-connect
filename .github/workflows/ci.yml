@@ -581,7 +581,16 @@ jobs:
       # Named for what it is, next to two AnywayConnect-macos-* artifacts that are not:
       # this is the only one of the three that will launch on a machine other than the
       # runner, and the only one that can register the privileged daemon.
+      #
+      # id: upload because the summary steps below report this artifact from this step's
+      # own outcome rather than from whether the JOB succeeded. The two are not the same
+      # question, and on the first real run they disagreed: the upload succeeded and the
+      # publish step after it failed, so a summary keyed on job success announced "there
+      # is no installable build of this branch" while a 947 KB installable build sat on
+      # the run. `outcome`, not `conclusion`: outcome is the step's own result, which is
+      # what is being asked.
       - uses: actions/upload-artifact@v7
+        id: upload
         with:
           name: AnywayConnect-installable
           path: ${{ env.ZIP }}
@@ -671,7 +680,31 @@ jobs:
           # UPDATES need PATCH, which is never issued here — so the read below is what
           # distinguishes "an earlier attempt got this far" from "somebody else's tag",
           # rather than a --force that does not exist in this file.
-          EXISTING=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)
+          #
+          # `git ls-remote`, NOT `gh api`. This probe is what failed on this file's first
+          # real run, and it failed in the one direction that matters: `gh api --jq` writes
+          # the HTTP error body to STDOUT, not stderr, so on a 404
+          # `$(gh api … 2>/dev/null || true)` captured
+          #   {"message":"Not Found","documentation_url":"…","status":"404"}
+          # into EXISTING instead of the empty string. `[ -z "$EXISTING" ]` was therefore
+          # false for an ABSENT tag, control fell to the elif, and the step refused to
+          # "move" a tag that did not exist. Every first publish would have died there;
+          # 2>/dev/null suppressed nothing and `|| true` threw away the only signal that
+          # would have given it away.
+          #
+          # ls-remote cannot be misread the same way: it prints nothing at all for an
+          # absent ref, exits 0, and writes its diagnostics to stderr — so "absent" and
+          # "broken" do not arrive through the same channel wearing the same clothes. It
+          # is also already the idiom version-gate uses for this exact question, which is
+          # why version-gate was unaffected, so this makes the file consistent as well as
+          # correct.
+          #
+          # ^{} first, then the plain form: ^{} dereferences an annotated tag and yields
+          # nothing for a lightweight one. The tag created below is lightweight, so in
+          # practice the second query is the one that answers — but a tag someone else
+          # made annotated must not read as absent, so both are asked.
+          EXISTING=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}' | head -1)
+          [ -n "$EXISTING" ] || EXISTING=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}' | head -1)
           if [ -z "$EXISTING" ]; then
             gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
               -f "ref=refs/tags/$TAG" -f "sha=$TARGET" --jq .ref
@@ -773,7 +806,16 @@ jobs:
             echo "$TAG has a release or a draft; leaving it alone"
             exit 0
           fi
-          AT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)
+          # ls-remote rather than `gh api`, for the reason spelled out in the publish step
+          # above: `gh api --jq` puts its 404 body on stdout, so the captured value for an
+          # absent tag was the error JSON rather than the empty string. Here that misread
+          # failed SAFE — a JSON blob is never equal to $TARGET, so the guard below bailed
+          # and nothing was deleted — which is exactly why it would have gone unnoticed
+          # indefinitely. It also made this compensating step inert in the window it
+          # exists for: after a cancellation between the tag POST and the release, the
+          # tag IS present, and a step that cannot read a ref cannot withdraw one.
+          AT=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}' | head -1)
+          [ -n "$AT" ] || AT=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}' | head -1)
           if [ "$AT" != "$TARGET" ]; then
             echo "$TAG is absent or does not point at $TARGET; leaving it alone"
             exit 0
@@ -811,18 +853,36 @@ jobs:
           {
             printf '## :rotating_light: `signed-build` FAILED — the rest of this run is telling you otherwise\n\n'
             printf 'This job carries `continue-on-error: true`, so the run conclusion, the commit status and the PR checks summary all report **success**. Nothing else on this page will say what you are reading here.\n\n'
-            printf -- '- There is **no installable build** of this branch. `AnywayConnect-macos-15` and `AnywayConnect-macos-26` are ad-hoc signed: they will not launch on another machine and cannot register the privileged daemon.\n'
+            # The installable artifact is NOT reported here any more. This banner used to
+            # assert "there is no installable build of this branch" on the strength of the
+            # job having failed, and on the first real run that was simply false: the
+            # upload succeeded and the publish step after it failed. Which artifacts exist
+            # is a question only the upload step can answer, so it is answered from that
+            # step's outcome in "Run summary (installable)" below — which now runs on
+            # failure too, precisely so this banner does not have to guess.
             if [ "${RC:-no}" = yes ]; then
               printf -- '- The release candidate `%s` was **not** published, or was published incompletely. Read the step log before assuming either.\n' "$RC_TAG"
             fi
             printf '\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # if: success() is what a step does by default; it is spelled out because its
-      # partner above is spelled out, and a reader comparing the two should not have to
-      # know that.
+      # always(), not success(). On a continue-on-error job the run summary is the only
+      # surface that reports anything truthfully, so a FAILED run needs this line more
+      # than a passing one does: "did I get an installable build out of this?" is the
+      # first thing a reader asks, and it is exactly the question a job-level failure
+      # used to suppress the answer to. Under success() this step was skipped on the
+      # first real run, which both withheld the artifact's only mention and left the
+      # failure banner's false claim about it unchallenged.
+      #
+      # always() also covers cancellation, where the honest answer is usually "no" and
+      # was previously not given at all.
+      #
+      # The condition moved from the step to the content: the step always speaks, and
+      # what it says is keyed on steps.upload.outcome. An unset outcome — the step never
+      # ran, because the build or the notarization died before it — falls through the
+      # case to the "none" branch, which is correct for that situation too.
       - name: Run summary (installable)
-        if: success()
+        if: always()
         env:
           # build_version, the same output the Package step names the zip from, so this
           # line and the artifact cannot disagree. It was `version` once — an output that
@@ -830,12 +890,20 @@ jobs:
           # did not trip: the step succeeded and announced `AnywayConnect-.zip`, an asset
           # that does not exist, in the one place a reader can learn this job's result.
           VERSION: ${{ steps.meta.outputs.build_version }}
+          UPLOADED: ${{ steps.upload.outcome }}
         run: |
           set -eu
           # shellcheck disable=SC2016
           {
             printf '### Installable build\n\n'
-            printf -- '- **`AnywayConnect-installable`** — `AnywayConnect-%s.zip`. The **only** artifact on this run that will launch on a machine other than the runner, and the only one that can register the privileged daemon: Developer ID signed, notarized, stapled. The two `AnywayConnect-macos-*` artifacts are ad-hoc signed and will do neither.\n\n' "$VERSION"
+            case "${UPLOADED:-}" in
+              success)
+                printf -- '- **`AnywayConnect-installable`** — `AnywayConnect-%s.zip`. The **only** artifact on this run that will launch on a machine other than the runner, and the only one that can register the privileged daemon: Developer ID signed, notarized, stapled. The two `AnywayConnect-macos-*` artifacts are ad-hoc signed and will do neither.\n\n' "$VERSION"
+                ;;
+              *)
+                printf -- '- **None.** The signed build did not get as far as uploading one, so there is no artifact on this run that will launch on another machine or register the privileged daemon. `AnywayConnect-macos-15` and `AnywayConnect-macos-26` are ad-hoc signed and will do neither.\n\n'
+                ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Always, including on a cancellation: "an rc was expected and is not there" is

@@ -100,6 +100,13 @@ jobs:
       # privileged path would install a default route the other would refuse.
       - name: Test on-link guard parity (shell)
         run: sh test/test-onlink-guard.sh
+      # The cask's refusal to uninstall while a tunnel is up. Runs here rather than only
+      # on the release path because the guard is Ruby inside a shell heredoc, where the
+      # shell eats an unescaped backtick without complaint — and the cask is rendered on
+      # the release-candidate path only, which a pull request that leaves VERSION alone
+      # never reaches. Without this step the guard would go unexercised until a bump.
+      - name: Test cask uninstall guard
+        run: sh test/test-cask-guard.sh
 
       # ditto rather than zip, to preserve the bundle's symlinks and resource forks.
       # actions/upload-artifact would otherwise flatten the signature and the download
@@ -670,6 +677,11 @@ jobs:
           # script runs, so a failure after that point leaves a zero-byte file that would
           # upload under the right name and satisfy the asset check below.
           [ -s anyway-connect.rb ] || { echo "::error::make-cask.sh produced no cask"; exit 1; }
+          # Same gate as release.yml, and this is the copy that matters: a prerelease
+          # never reaches the tap, so a pull request is where a mangled cask should be
+          # caught. See the longer note there for why non-empty is not enough.
+          ruby -c anyway-connect.rb >/dev/null \
+            || { echo "::error::make-cask.sh produced a cask that is not valid Ruby"; exit 1; }
 
           # Idempotency. A re-run of this same run recomputes the same tag, because
           # run_number does not change on a re-run — so "already published" means done,

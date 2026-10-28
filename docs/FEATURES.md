@@ -984,7 +984,16 @@ source, casks install prebuilt macOS applications.
 
 `scripts/make-cask.sh <version> <sha256>` renders it, and the release workflow uses
 that same script — so the cask attached to a release and the one pushed to the tap
-are produced identically. It passes `brew style` and `brew audit` clean.
+are produced identically.
+
+`brew style` reports exactly one offence, and it is deliberate: `Cask/InstallSteps`
+wants `uninstall_preflight_steps` in place of the `uninstall_preflight` block. That
+replacement is a declarative DSL — `mkdir_p`, `touch`, `move`, `symlink`,
+`set_ownership` — with no way to inspect the system and no way to abort, so it cannot
+express the refusal described below, which is the only reason the block exists. The
+offence is a convention rather than an error and the legacy block still runs. If a
+future Homebrew removes it, the guard moves to `uninstall early_script:`, which runs
+ahead of every other uninstall directive.
 
 Two stanzas are doing real work rather than filling in a template.
 
@@ -1010,6 +1019,43 @@ files the sudo backend may have installed — `/etc/sudoers.d/anyway-connect`,
 the app to the Trash would leave a registered root daemon and a passwordless sudo
 rule behind, which is the sort of residue an uninstaller exists to prevent. `zap`
 additionally takes `~/.config/anyway-connect` and the preferences domain.
+
+### Why uninstalling is guarded
+
+That same `uninstall` stanza is dangerous while a tunnel is up, and `brew upgrade`
+runs it — so a routine version bump was enough to trigger it, with no warning.
+
+`/usr/local/libexec/anyway-connect` holds `route-wrapper.sh` and `vpnc-script`. The
+wrapper is what openconnect was given as `--script`, and openconnect runs it at
+disconnect to put the routing table and the resolvers back. Delete it from under a
+live tunnel and there is nothing left to undo what the tunnel did: the routes and the
+scoped resolvers outlive the interface they point at, and the machine loses the network
+in a way that waiting does not fix. The daemon that would otherwise sweep them is
+unregistered by the `launchctl:` directive in the same stanza, one step earlier.
+
+So `uninstall_preflight` refuses. It reads `/var/run/anyway-connect.pid` and also runs
+`pgrep -f -- --pid-file=/var/run/anyway-connect.pid`, because a live openconnect whose
+pid file was already removed is exactly the state the reconcile sweep exists for. A
+pid is treated as alive when `kill(0)` succeeds **and** when it fails with `EPERM` —
+openconnect runs as root, and reading a permission failure as "the tunnel is gone" is
+the single mistake that would make the guard worse than useless. `ESRCH` is the only
+answer that means dead. Pids of 1 or less are ignored, since `kill(0, 0)` signals the
+whole process group.
+
+The refusal names the live pids, says to disconnect and quit first, and advertises
+`ANYWAY_CONNECT_ALLOW_LIVE_TEARDOWN=1`. The escape hatch is advertised rather than
+hidden because a pid file that outlives its process must not be able to wedge an
+uninstall permanently.
+
+Only the uninstall side is guarded. A plain install deletes nothing — it replaces the
+bundle, which an orphaned tunnel survives, and the wrapper stays where openconnect
+expects it.
+
+Quitting the app is deliberately **not** made to disconnect. The tunnel is designed to
+outlive the app process: liveness is established by scanning for openconnect rather
+than by holding a child handle, which is what lets a relaunched app re-attach to a
+tunnel it did not start. Tearing down on quit would also drop the tunnel during the
+single-instance handoff, where a second launch signals the first copy to exit.
 
 ### What it requires
 

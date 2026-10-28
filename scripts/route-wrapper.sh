@@ -112,7 +112,44 @@ add_onlink_route() {
     fi
 }
 
-del_route() { /sbin/route -n delete -net "$1" "$2" >/dev/null 2>&1; }
+# Withdraw BOTH forms, because add_route installs both.
+#
+# `route delete -net X GW` removes only the unscoped entry. The `-ifscope` duplicate
+# survives it, and this file already explains twice over what that costs — then did not
+# undo it. The leaked entry is harmless while the physical gateway is unchanged, because
+# it names the same router the system would pick anyway. It turns harmful at the next
+# NETWORK CHANGE: it keeps naming the old gateway, still wins for traffic on that
+# interface, and blackholes its destination. Measured on 2026-10-27: 129 exception routes
+# while connected, 10 after a clean disconnect, and every one of the nine survivors was
+# `-ifscope`d. They stayed dead until a wake sweep removed them.
+#
+# ONE scoped delete, not the bounded drain add_route uses, and the asymmetry is deliberate
+# rather than an oversight to tidy away. A `route` spawn measured 8.9 ms on a loaded
+# machine, so ~130 exceptions cost 1.15s as this stood, 2.31s with the second delete, and
+# 3.46s with a drain. handleWillSleep's teardown is bounded at 5s (FR-3.7), and a teardown
+# cut off part-way through at sleep is WORSE than the leak: it strands the routes and the
+# tunnel state together, with the network already gone. Nor is a drain needed to hold the
+# line — add_route installs exactly one scoped entry per connect and this removes exactly
+# one, so accumulation cannot grow. A pile left by an older build, or one belonging to a
+# destination no longer in the exception list, is out of reach here either way, because
+# this only iterates the CURRENT list; that is the reconcile sweep's job, and it already
+# deletes both forms.
+#
+# Neither command form is invented. The unscoped delete keeps its gateway argument, which
+# is what has been in production. The scoped one takes `-ifscope` last and no gateway,
+# which is the form add_route's own pre-add drain uses. `route` refuses to parse-check
+# without root — it answers "must be root to alter routing table" even for a deliberate
+# typo — so a third spelling could not have been validated before shipping it.
+#
+# Returns 0 unconditionally. Nothing reads the status (the sole caller invokes it bare in
+# a for loop) and the script sets no `-e`, but a delete that legitimately finds nothing to
+# remove must not read as a failure if that ever changes.
+del_route() {
+    _net="$1"; _gw="$2"; _if="$3"
+    /sbin/route -n delete -net "$_net" "$_gw" >/dev/null 2>&1
+    [ -n "$_if" ] && /sbin/route -n delete -net "$_net" -ifscope "$_if" >/dev/null 2>&1
+    return 0
+}
 
 # Mask a dotted IPv4 address to a prefix length. POSIX arithmetic only: no ** and
 # no python, so the partial octet comes from a lookup.
@@ -219,7 +256,9 @@ case "$reason" in
                 if [ -n "$LOCAL_SUBNET" ] && inside_subnet "$CIDR" "$LOCAL_SUBNET"; then
                     continue
                 fi
-                del_route "$CIDR" "$PHYS_GW"
+                # PHYS_IF, so the interface-scoped twin add_route installed goes too.
+                # Already in scope — local_subnet() above is called with it.
+                del_route "$CIDR" "$PHYS_GW" "$PHYS_IF"
             done
         fi
         ;;

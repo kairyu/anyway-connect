@@ -104,7 +104,15 @@ add_onlink_route() {
     while [ "$_n" -lt 8 ] && /sbin/route -n delete -net "$_net" -ifscope "$_if" >/dev/null 2>&1; do
         _n=$((_n + 1))
     done
-    /sbin/route -n add -net "$_net" -interface "$_if" -ifscope "$_if" >/dev/null 2>&1
+    # Unscoped only. An `-ifscope` copy used to be added here too, and it broke the
+    # network on the next visit: nothing removes it (disconnect leaves on-link routes
+    # alone, and so does the reconcile sweep), it outlives leaving the network, and it
+    # stays bound to the address en0 had when it was added. Private Wi-Fi Address
+    # rotation hands out a new address on almost every return, so traffic through the
+    # stale copy fails with errno 49 — including to the router — and the whole network
+    # is dead until it is deleted. Confirmed on 2026-10-29 by deleting just that route
+    # on a broken network and watching it recover. The drain above still removes any
+    # copy an older version left, the next time this subnet is connected on.
     if /sbin/route -n add -net "$_net" -interface "$_if" >/dev/null 2>&1; then
         log "kept $_net on-link via $_if"
     else

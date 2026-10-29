@@ -31,12 +31,17 @@ public func privilegedDaemonLabel() -> String {
 /// something else. Same reasoning as the shell helper's `version` subcommand.
 ///
 /// Version 1 is the first release of this protocol, in step with the app's own 1.0.
+/// Version 2 (1.0.1-1.0.2) changed `restoreDefaultRoute` to take an interface and
+/// added `reconcile`. Version 3 (1.0.3) returns to version 1's method set and
+/// arguments. It is numbered above 2 rather than reusing 1 because the app accepts
+/// any daemon at or above the version it expects, so a 1 would accept a 1.0.2
+/// daemon whose `restoreDefaultRoute` means something else.
 ///
 /// Bump it whenever an argument's meaning changes — and only ever bump it. Lowering it
 /// would tell the app to accept a daemon that predates whatever the raise was protecting
 /// against, and the check exists precisely so a mismatched pair falls back to sudo rather
 /// than calling each other with arguments that mean something else.
-public let kPrivilegedProtocolVersion = 1
+public let kPrivilegedProtocolVersion = 3
 
 /// Suffix distinguishing the daemon's signing identifier from the app's.
 public let kHelperIdentifierSuffix = ".privhelper"

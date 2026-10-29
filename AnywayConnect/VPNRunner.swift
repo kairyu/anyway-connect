@@ -133,7 +133,8 @@ final class VPNRunner {
     func invalidateTransportCache() { cachedTransport = nil }
 
     /// Argument-protocol version this build speaks to the root helper.
-    private let requiredHelperVersion = 2
+    /// 4, not 2: 1.0.2's helper answers 3 and must not pass the `>=` check below.
+    private let requiredHelperVersion = 4
 
     /// True only if the installed helper is present, sudo-granted, and speaks a
     /// compatible argument protocol.

@@ -103,7 +103,13 @@ valid_iface() {
 # Argument-protocol version. Bump whenever a subcommand's arguments change, so
 # an app paired with an older installed helper can detect the mismatch instead
 # of invoking it with arguments that mean something else.
-HELPER_VERSION=2
+#
+# Version 3 (1.0.1-1.0.2) read `restore-default <interface>` and added
+# `reconcile`. Version 4 (1.0.3) returns to version 2's subcommands and
+# arguments. It is numbered above 3 rather than reusing 2 because the app
+# accepts any helper at or above the version it requires, so a 2 would accept
+# a 1.0.2 helper whose `restore-default` means something else.
+HELPER_VERSION=4
 
 CMD="${1:-}"; shift 2>/dev/null || true
 case "$CMD" in

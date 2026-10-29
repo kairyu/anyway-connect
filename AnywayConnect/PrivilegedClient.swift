@@ -239,7 +239,7 @@ final class PrivilegedClient {
     /// mismatch could never be observed. Overriding only the app's expectation
     /// produces a genuine version disagreement against the real installed daemon:
     ///
-    ///   defaults write me.kairyu.anywayconnect DebugExpectedProtocolVersion 2
+    ///   defaults write me.kairyu.anywayconnect DebugExpectedProtocolVersion 4
     ///   defaults delete me.kairyu.anywayconnect DebugExpectedProtocolVersion
     ///
     /// Values below the real version are ignored: the override exists to demand

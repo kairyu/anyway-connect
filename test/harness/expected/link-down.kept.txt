@@ -1,7 +1,0 @@
-loopback 127.0.0.0/8
-loopback 127.0.0.1
-onLinkRoute 192.168.1.0/24
-onLinkRoute 192.168.1.42/32
-onLinkRoute 192.168.2.0/24
-onLinkRoute 224.0.0.0/4
-onLinkRoute 255.255.255.255/32

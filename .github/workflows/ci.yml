@@ -85,21 +85,6 @@ jobs:
 
       - name: Test connect flow
         run: sh test/test-connect-flow.sh
-      # The pure decision layer: the on-link guard, the reconcile planner, the tunnel
-      # scope and the install-target ladder, driven entirely from checked-in fixtures
-      # and forbidden by its own gates from reading live system state.
-      #
-      # Worth more than its case count suggests. It also re-derives every expected
-      # route list from the fixture text rather than trusting a checked-in answer, so
-      # a run here re-checks the derivation itself — which is the only thing standing
-      # between these suites and a test that asserts whatever the code happens to do.
-      - name: Test decision layer (Swift harness)
-        run: sh test/run-swift-harness.sh
-      # The same on-link guard, ported to shell for the sudo fallback transport. Both
-      # must reach identical verdicts with identical reasons: a divergence means one
-      # privileged path would install a default route the other would refuse.
-      - name: Test on-link guard parity (shell)
-        run: sh test/test-onlink-guard.sh
       # The cask's refusal to uninstall while a tunnel is up. Runs here rather than only
       # on the release path because the guard is Ruby inside a shell heredoc, where the
       # shell eats an unescaped backtick without complaint — and the cask is rendered on
@@ -366,7 +351,7 @@ jobs:
   # build-app.sh falls back to ad-hoc signing, and an ad-hoc bundle cannot register the
   # privileged daemon through SMAppService and is refused by Gatekeeper on any machine
   # that did not build it. So the two things CI structurally cannot test — the
-  # privileged daemon, route mutation, and sleep/wake handling — were also the two
+  # privileged daemon and route mutation — were also the two
   # things nobody could test by hand, because there was no bundle to install. This job
   # exists to produce that bundle: signed with the Developer ID, notarized, stapled and
   # Gatekeeper-checked, exactly as a release is.

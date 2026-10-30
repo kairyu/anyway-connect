@@ -15,8 +15,7 @@
 # filter extension failed 43,928 socket writes with errno 49 ("Can't assign
 # requested address") from the instant of the lid-open wake until the reboot,
 # with zero such errors before the sleep and zero after it. Routing, addressing
-# and DNS were all healthy, and the app's sleep teardown and wake reconcile did
-# exactly the right thing.
+# and DNS were all healthy.
 #
 # Establishing that took a day of log archaeology. The whole point of this
 # script is to say it in half a minute, so the next incident costs a coffee
@@ -36,16 +35,14 @@
 # The one place it signals a process is its own bounded child, in `bounded()`
 # below, which is how "never hang" is implemented. Nothing else.
 #
-# WHY THE VERDICTS CAN BE TRUSTED TO AGREE WITH THE APP
+# HOW THE ON-LINK CHECK WORKS
 #
 # Every "is this next hop on-link?" question is answered by `guard()` in the
-# awk block below, which is a line-for-line transliteration of
-# `evaluateDefaultGateway` in AnywayConnect/NetGuard.swift — same twelve steps,
-# same fixed order, same rejection names — and the route-table parsing follows
-# .agents/tasks/net-resilience-fix/design.md §4.2 including the header-derived
-# column indices. That is deliberate: a diagnostic that reaches a different
-# verdict from the code it is diagnosing is worse than no diagnostic. If the
-# two ever disagree, this script is the one that is wrong.
+# awk block below. It is this script's own check: twelve steps in a fixed
+# order, each rejection with its own name, so a verdict always says which
+# step refused the next hop. The route-table parsing finds its columns from
+# the `netstat -rn` header row rather than assuming fixed positions, so a
+# column macOS adds or reorders cannot shift every reading by one.
 
 set -u
 
@@ -245,7 +242,7 @@ function ip2n(s,   n, p, i, o, v) {
         o = p[i]
         if (o !~ /^[0-9]+$/) return -1
         if (length(o) < 1 || length(o) > 3) return -1
-        if (length(o) > 1 && substr(o, 1, 1) == "0") return -1   # NetGuard rejects 010.0.1.1
+        if (length(o) > 1 && substr(o, 1, 1) == "0") return -1   # a leading zero is rejected: 010.0.1.1
         if (o + 0 > 255) return -1
         v = v * 256 + (o + 0)
     }
@@ -295,10 +292,8 @@ function tunnelish(name, p2p) {
     return (name ~ /^(utun|ppp|ipsec|gif|stf)/) ? 1 : 0
 }
 
-# ---- The guard. evaluateDefaultGateway (NetGuard.swift), step for step. The
-#      ORDER IS FIXED and must not be tidied: the reason returned for a given
-#      input is what the plan clauses in design.md §4.3(b)/(c) branch on, and
-#      what this script branches on below.
+# ---- The guard. The ORDER IS FIXED and must not be tidied: the reason
+#      returned for a given input is what this script branches on below.
 function guard(g, t,   gn, i, nm, j, mi, mp, pb) {
     # 1. the interface name (PrivilegedValidation.isValidInterface + IFNAMSIZ-1)
     if (t == "" || length(t) > 15 || t !~ /^[0-9a-z]+$/) return "malformedInterfaceName"
@@ -339,7 +334,7 @@ function guard(g, t,   gn, i, nm, j, mi, mp, pb) {
     return "accept"
 }
 
-# The sweep ladder, design.md §4.3(c): a gateway is alive if the guard accepts
+# The reachability ladder: a gateway is alive if the guard accepts
 # it for ANY live, addressed, non-tunnel link, and "on a tunnel" if the guard
 # stops at step 8. Anything else is a route to nowhere. Note that a VANISHED
 # utun`s address falls through to nowhere, which is the intended answer and the
@@ -409,9 +404,8 @@ BEGIN {
     # Column indices are DERIVED FROM THE HEADER, never assumed positional:
     # older netstat layouts carry Refs/Use between Flags and Netif, and reading
     # Netif as field 4 there makes every netif a number -- no utun default is
-    # ever recognised and every scoped deletion aims at -ifscope 0 (design
-    # §4.2 rule 1, finding 14). If any of the four columns is missing we abort
-    # rather than guess.
+    # ever recognised and every scoped deletion aims at -ifscope 0. If any of
+    # the four columns is missing we abort rather than guess.
     ci = cg = cf = cn = 0
     rows = ndef = nleft = nkept = nunp = 0
     while ((getline ln < RT) > 0) {
@@ -451,13 +445,13 @@ BEGIN {
             continue
         }
 
-        # ---- the sweep, first match decides (design §4.3(c)) --------------
+        # ---- the leftover-route check, first match decides ---------------
         # A gateway that is not an IPv4 literal (link#N, a MAC, an -interface
-        # route) is the LAN on-link row: kept, never swept.
+        # route) is the LAN on-link row: kept, never counted.
         if (gwn < 0) { nkept++; continue }
         if (netif == "lo0") { nkept++; continue }
 
-        # Canonicalise the destination per §4.2 rules 2-5. netstat abbreviates
+        # Canonicalise the destination. netstat abbreviates
         # by dropping trailing zero octets, and anything we cannot name exactly
         # is never counted as leftover -- a destination we cannot name cannot be
         # named to `route delete` either.
@@ -490,7 +484,7 @@ BEGIN {
             } else { nunp++; continue }
         }
 
-        # Loopback / multicast / link-local / all-ones: never ours, never swept.
+        # Loopback / multicast / link-local / all-ones: never ours, never counted.
         if (dn >= 2130706432 && dn < 2147483648) { nkept++; continue }   # 127/8
         if (dn >= 3758096384 && dn < 4026531840) { nkept++; continue }   # 224/4
         if (dn >= 2851995648 && dn < 2852061184) { nkept++; continue }   # 169.254/16
@@ -724,16 +718,13 @@ else
     line "openconnect: not running"
 fi
 
-for f in /var/run/anyway-connect.pid \
-         /var/run/anyway-connect.netstate.json \
-         /var/run/anyway-connect.tunnels.json; do
-    if [ -e "$f" ]; then
-        line "state file: $f  ($(wc -c <"$f" | tr -d ' ') bytes, $(date -r "$f" '+%Y-%m-%d %H:%M:%S'))"
-        cp "$f" "$BUNDLE/$(basename "$f")" 2>/dev/null
-    else
-        line "state file: $f  ABSENT"
-    fi
-done
+f=/var/run/anyway-connect.pid
+if [ -e "$f" ]; then
+    line "state file: $f  ($(wc -c <"$f" | tr -d ' ') bytes, $(date -r "$f" '+%Y-%m-%d %H:%M:%S'))"
+    cp "$f" "$BUNDLE/$(basename "$f")" 2>/dev/null
+else
+    line "state file: $f  ABSENT"
+fi
 
 PIDFILE_PID=""
 [ -r /var/run/anyway-connect.pid ] && PIDFILE_PID=$(tr -d ' \n' </var/run/anyway-connect.pid 2>/dev/null)
@@ -821,11 +812,6 @@ EOF
     # unambiguously ours: traffic aimed down a tunnel with nothing on the end.
     if [ "$TUNNEL_DEFAULTS" -gt 0 ] && [ "$OC_RUNNING" -eq 0 ]; then
         line "  !! default route(s) via$TUNNEL_DEFAULT_IFS with NO openconnect running."
-        PREEX=""
-        [ -r /var/run/anyway-connect.netstate.json ] \
-            && PREEX=$(sed -n 's/.*"preexistingTunnels":\[\([^]]*\)\].*/\1/p' \
-                       /var/run/anyway-connect.netstate.json 2>/dev/null | tr -d '"')
-        [ -n "$PREEX" ] && line "  (netstate says these tunnels pre-dated our session: $PREEX)"
     fi
 
     if [ "$STALE_DEFAULTS" -gt 0 ]; then
@@ -1153,11 +1139,13 @@ elif [ "$APP_FAULT" -eq 1 ]; then
     [ "$TUNNEL_DEFAULTS" -gt 0 ] && [ "$OC_RUNNING" -eq 0 ] && printf '    - the default route goes down a tunnel with no tunnel process alive\n'
     [ "$UTUN_KEYS" -gt 0 ] && [ "$OC_RUNNING" -eq 0 ] && printf '    - %s configd utun DNS/IPv4 key(s) with no tunnel behind them\n' "$UTUN_KEYS"
     [ "${LEFTOVER:-0}" -gt 0 ] && printf '    - %s leftover route(s) via a gateway that is on no live link\n' "$LEFTOVER"
-    printf '\n  WHAT TO DO. In AnywayConnect, Connect and then Disconnect once: the\n'
-    printf '  disconnect path runs the reconcile that deletes exactly this state. If\n'
-    printf '  the app is wedged, quitting and relaunching it runs a reconcile at\n'
-    printf '  launch. Neither needs a reboot. Keep the bundle either way — this is a\n'
-    printf '  bug in the app and the bundle is what makes it fixable.\n'
+    printf '\n  WHAT TO DO. In AnywayConnect, Connect and then Disconnect once:\n'
+    printf '  openconnect'"'"'s disconnect script removes the routes and DNS state its\n'
+    printf '  tunnel installed. Anything it leaves is listed in section 3. Delete a\n'
+    printf '  route by hand with "sudo route -n delete -net <destination>" (add\n'
+    printf '  "-ifscope <interface>" for a scoped one), or reboot. Keep the bundle\n'
+    printf '  either way — this is a bug in the app and the bundle is what makes it\n'
+    printf '  fixable.\n'
     RC=1
 elif [ "$EXT_STORM" -eq 1 ] || { [ "$DNS_DEAD" -eq 1 ] && [ "$EXT_WORST" -gt 0 ]; }; then
     printf '  THIS IS NOT AnywayConnect. %s is failing socket operations.\n' "$EXT_WORST_NAME"
@@ -1275,7 +1263,7 @@ OTHER
 elif [ "$FLOW" = ok ]; then
     printf '  NOTHING WRONG HERE. Routing is correct, DNS configuration is coherent,\n'
     printf '  and data flows at every layer probed.\n'
-    [ "${LEFTOVER:-0}" -gt 0 ] && printf '  Note: %s leftover route(s) are present. They blackhole only those\n  destinations, not the machine, and a Connect/Disconnect cycle clears them.\n' "$LEFTOVER"
+    [ "${LEFTOVER:-0}" -gt 0 ] && printf '  Note: %s leftover route(s) are present. They blackhole only those\n  destinations, not the machine, and deleting them by hand or a reboot clears them.\n' "$LEFTOVER"
     RC=0
 elif [ "$FLOW" = dns ] || [ "$FLOW" = beyond ] || [ "$FLOW" = link ]; then
     printf '  CANNOT TELL — and that is the honest answer.\n'
@@ -1303,7 +1291,7 @@ line "reboot to recover the machine and still have everything below afterwards."
 line ""
 line "Contains: the route table, ifconfig, scutil --dns, the configd key list,"
 line "the loaded system extensions, the launchd record of the daemon, the"
-line "/var/run state files, the sleep/wake lines from pmset, the DNS telemetry"
+line "/var/run pid file, the sleep/wake lines from pmset, the DNS telemetry"
 line "counts, and report.txt — a verbatim copy of everything printed above,"
 line "written as it was printed, so you do not have to remember to redirect."
 line ""

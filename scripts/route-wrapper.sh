@@ -106,7 +106,7 @@ add_onlink_route() {
     done
     # Unscoped only. An `-ifscope` copy used to be added here too, and it broke the
     # network on the next visit: nothing removes it (disconnect leaves on-link routes
-    # alone, and so does the reconcile sweep), it outlives leaving the network, and it
+    # alone), it outlives leaving the network, and it
     # stays bound to the address en0 had when it was added. Private Wi-Fi Address
     # rotation hands out a new address on almost every return, so traffic through the
     # stale copy fails with errno 49 — including to the router — and the whole network
@@ -129,19 +129,17 @@ add_onlink_route() {
 # NETWORK CHANGE: it keeps naming the old gateway, still wins for traffic on that
 # interface, and blackholes its destination. Measured on 2026-10-27: 129 exception routes
 # while connected, 10 after a clean disconnect, and every one of the nine survivors was
-# `-ifscope`d. They stayed dead until a wake sweep removed them.
+# `-ifscope`d.
 #
 # ONE scoped delete, not the bounded drain add_route uses, and the asymmetry is deliberate
-# rather than an oversight to tidy away. A `route` spawn measured 8.9 ms on a loaded
-# machine, so ~130 exceptions cost 1.15s as this stood, 2.31s with the second delete, and
-# 3.46s with a drain. handleWillSleep's teardown is bounded at 5s (FR-3.7), and a teardown
-# cut off part-way through at sleep is WORSE than the leak: it strands the routes and the
-# tunnel state together, with the network already gone. Nor is a drain needed to hold the
-# line — add_route installs exactly one scoped entry per connect and this removes exactly
-# one, so accumulation cannot grow. A pile left by an older build, or one belonging to a
-# destination no longer in the exception list, is out of reach here either way, because
-# this only iterates the CURRENT list; that is the reconcile sweep's job, and it already
-# deletes both forms.
+# rather than an oversight to tidy away. add_route installs exactly one scoped entry per
+# connect and this removes exactly one, so they cannot accumulate. Time matters here:
+# this runs inside openconnect's disconnect, which the stop path gives 10s after SIGINT
+# before escalating to SIGTERM, and a teardown cut off part-way through leaves routes
+# behind. A `route` spawn measured 8.9 ms on a loaded machine, so ~130 exceptions cost
+# 1.15s as this stood, 2.31s with the second delete, and 3.46s with a drain. Entries left
+# by an older build, or belonging to a destination no longer in the exception list, are
+# out of reach here either way, because this only iterates the CURRENT list.
 #
 # Neither command form is invented. The unscoped delete keeps its gateway argument, which
 # is what has been in production. The scoped one takes `-ifscope` last and no gateway,

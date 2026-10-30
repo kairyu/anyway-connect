@@ -7,7 +7,7 @@
 # openconnect was given when the tunnel was built, and what it runs at disconnect to put
 # the routing table and the resolvers back. Deleting it under a live tunnel leaves
 # nothing to undo what the tunnel did. `brew upgrade` runs that uninstall, so a routine
-# version bump reaches the same wedge the reconnect work was written to prevent. The
+# version bump would leave the routing table wedged with nothing to undo it. The
 # guard in uninstall_preflight is what stands in the way, and this is what keeps it
 # honest.
 #

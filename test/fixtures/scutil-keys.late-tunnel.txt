@@ -1,8 +1,0 @@
-  subKey [0] = State:/Network/Service/11111111-2222-3333-4444-555555555555/DNS
-  subKey [1] = State:/Network/Service/11111111-2222-3333-4444-555555555555/IPv4
-  subKey [2] = State:/Network/Service/utun0/DNS
-  subKey [3] = State:/Network/Service/utun0/IPv4
-  subKey [4] = State:/Network/Service/utun7/DNS
-  subKey [5] = State:/Network/Service/utun7/IPv4
-  subKey [6] = State:/Network/Service/utun9/DNS
-  subKey [7] = State:/Network/Service/utun9/IPv4

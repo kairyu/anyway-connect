@@ -239,7 +239,7 @@ final class PrivilegedClient {
     /// mismatch could never be observed. Overriding only the app's expectation
     /// produces a genuine version disagreement against the real installed daemon:
     ///
-    ///   defaults write me.kairyu.anywayconnect DebugExpectedProtocolVersion 3
+    ///   defaults write me.kairyu.anywayconnect DebugExpectedProtocolVersion 4
     ///   defaults delete me.kairyu.anywayconnect DebugExpectedProtocolVersion
     ///
     /// Values below the real version are ignored: the override exists to demand
@@ -308,51 +308,26 @@ final class PrivilegedClient {
         return version >= expectedProtocolVersion
     }
 
-    /// 40s: 5s waiting on the daemon's mutation gate + 5s for the pre-launch `netstat`
-    /// snapshot + the 20s this call has always allowed for validation and the spawn,
-    /// plus slack.
-    ///
-    /// Outcome-typed for the same reason the restore is, and here it matters more: the
-    /// daemon can now REFUSE a start because a reconcile holds the gate, and the sudo
-    /// fallback behind this call `exec`s openconnect with no liveness check and no lock
-    /// — straight into the running sweep. A refusal must therefore reach the caller as
-    /// a refusal, not as "the daemon failed, try something weaker".
     func startTunnel(protocolName: String, host: String, fingerprint: String, resolve: String,
                      autoAddLocalSubnet: Bool, exceptionRoutes: [String],
-                     logPath: String, cookie: String) -> PrivilegedOutcome {
-        let result: (Bool, String)? = call(timeout: 40) { proxy, done in
+                     logPath: String, cookie: String) -> (ok: Bool, message: String) {
+        let result: (Bool, String)? = call(timeout: 20) { proxy, done in
             proxy.startTunnel(protocolName: protocolName, host: host, fingerprint: fingerprint,
                               resolve: resolve, autoAddLocalSubnet: autoAddLocalSubnet,
                               exceptionRoutes: exceptionRoutes, logPath: logPath,
                               cookie: cookie) { ok, message in done((ok, message)) }
         }
-        guard let result = result else {
-            return .unreachable("privileged daemon did not respond")
-        }
-        return result.0 ? .ok(result.1) : .refused(result.1)
+        guard let result = result else { return (false, "privileged daemon did not respond") }
+        return result
     }
 
-    /// 30s, derived rather than guessed: the daemon's worst case is `pgrep` 5s +
-    /// `ps` 3s (the rare arm) + the 10s SIGINT wait + the 5s SIGTERM wait = 23s,
-    /// plus two small file writes. PER CALL rather than for the first one only,
-    /// because stops run CONCURRENTLY in the daemon — `boundedTeardown(limit: 5)`
-    /// returns early by design, so a wake sequence and a menu Disconnect can
-    /// genuinely overlap, and serialising them would put 46s against this timeout.
-    ///
-    /// The ceiling is the disconnect step's 60s budget, whose arithmetic is written
-    /// out at AppDelegate.swift's `timeout`.
-    func stopTunnel() -> PrivilegedOutcome {
-        let result: (Bool, String)? = call(timeout: 30) { proxy, done in
+    func stopTunnel() -> (ok: Bool, message: String) {
+        // Generous: the daemon waits up to 10s for a graceful teardown.
+        let result: (Bool, String)? = call(timeout: 20) { proxy, done in
             proxy.stopTunnel { ok, message in done((ok, message)) }
         }
-        guard let result = result else {
-            return .unreachable("privileged daemon did not respond")
-        }
-        // `false` from THIS operation means "found something and did not stop it".
-        // stopTunnel takes no arguments, performs no validation and has no guard
-        // refusal, so there is no `.refused` to confuse it with — see the comment
-        // on the protocol declaration.
-        return result.0 ? .ok(result.1) : .failed(result.1)
+        guard let result = result else { return (false, "privileged daemon did not respond") }
+        return result
     }
 
     func tunnelStatus() -> (running: Bool, pid: Int)? {
@@ -363,75 +338,13 @@ final class PrivilegedClient {
         return (result.0, result.1)
     }
 
-    /// Put the physical default back on `interface`. No gateway crosses the boundary:
-    /// the daemon derives the next hop and guards it.
-    ///
-    /// 30s, derived rather than guessed. The daemon's worst case here is four NetProbe
-    /// collectors at 5s each (interfaces, dhcpRouter's two ipconfig calls, netstat) plus
-    /// three bounded `route` calls at 5s, behind a 5s wait on the mutation gate.
-    func restoreDefaultRoute(interface: String) -> PrivilegedOutcome {
-        let result: (Bool, String)? = call(timeout: 30) { proxy, done in
-            proxy.restoreDefaultRoute(interface: interface) { ok, message in
+    func restoreDefaultRoute(gateway: String, interface: String) -> (ok: Bool, message: String) {
+        let result: (Bool, String)? = call(timeout: 10) { proxy, done in
+            proxy.restoreDefaultRoute(gateway: gateway, interface: interface) { ok, message in
                 done((ok, message))
             }
         }
-        guard let result = result else {
-            return .unreachable("privileged daemon did not respond")
-        }
-        return result.0 ? .ok(result.1) : .refused(result.1)
-    }
-
-    /// Sweep leftover VPN routing/DNS state and re-install a usable physical default.
-    ///
-    /// 90s, derived from the daemon's three phase budgets: prologue ≤ 15s plus one 5s
-    /// command overshoot, sweep ≤ 20s plus 5s, install ≤ 30s (four collectors at 5s and
-    /// two `route` calls at 5s) — 75s worst case, plus slack.
-    ///
-    /// Deliberately generous rather than tight. A timeout here reads as `.unreachable`,
-    /// which starts a SECOND reconcile on the sudo-helper transport while the first is
-    /// still sweeping — strictly worse than waiting. The realistic path is under 3s; a
-    /// dirty table is a few seconds.
-    func reconcile(dryRun: Bool = false) -> PrivilegedOutcome {
-        let result: (Bool, String)? = call(timeout: 90) { proxy, done in
-            proxy.reconcile(dryRun: dryRun) { ok, message in done((ok, message)) }
-        }
-        guard let result = result else {
-            return .unreachable("privileged daemon did not respond")
-        }
-        return result.0 ? .ok(result.1) : .refused(result.1)
-    }
-}
-
-// ── Why an outcome and not a Bool ────────────────────────────────────────────
-//
-// A guard REFUSAL and an UNREACHABLE daemon demand opposite caller behaviour, and
-// collapsing them into `false` is what makes "fall back to sudo" unsafe.
-//
-// A refusal is an answer: the daemon evaluated the request against the live system and
-// said no. Retrying it on a weaker transport is bypassing the guard that just spoke.
-// An unreachable daemon has said nothing at all, so falling through is correct and is
-// exactly what the daemon branches already did before this type existed.
-enum PrivilegedOutcome: Equatable {
-    /// The daemon acted, or correctly declined to act (a no-op is a success).
-    case ok(String)
-    /// The daemon answered "no". Do NOT retry on another transport.
-    case refused(String)
-    /// The daemon RAN the operation and it did not achieve its postcondition.
-    ///
-    /// Unlike `.refused` this is not an answer about the REQUEST, so a fallback
-    /// transport is legitimate — a stuck openconnect is precisely the case where
-    /// the sudo fallback is wanted, and in the observed incident the recovery was
-    /// the developer terminating it by hand. Unlike `.unreachable` the daemon is
-    /// reachable and healthy, so the transport cache must NOT be invalidated:
-    /// dropping it would discard a measurement for no reason.
-    case failed(String)
-    /// Transport failure or timeout. Fall through, as before.
-    case unreachable(String)
-
-    /// The message, whichever arm this is — for logging, which never branches on it.
-    var message: String {
-        switch self {
-        case .ok(let m), .refused(let m), .failed(let m), .unreachable(let m): return m
-        }
+        guard let result = result else { return (false, "privileged daemon did not respond") }
+        return result
     }
 }

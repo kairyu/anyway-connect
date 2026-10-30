@@ -104,8 +104,7 @@ cask "anyway-connect" do
   #
   # A kill(0) that fails with EPERM means the process EXISTS and this user merely may
   # not signal it — openconnect runs as root. Reading that as "gone" is the single
-  # mistake this guard is here to avoid, and it is the rule the app itself follows;
-  # SingleInstance.swift spells it out at length.
+  # mistake this guard is here to avoid.
   uninstall_preflight do
     pid_file = "/var/run/anyway-connect.pid"
     alive = lambda do |pid|
@@ -124,7 +123,7 @@ cask "anyway-connect" do
     pids = []
     pids << File.read(pid_file).strip.to_i if File.readable?(pid_file)
     # The pid file alone is not evidence enough: a tunnel whose file was removed while
-    # the process lived is exactly the state the reconcile sweep was written for. pgrep
+    # the process lived is a tunnel the pid file alone would miss. pgrep
     # needs the -- , because the pattern it is given starts with a dash.
     scan = system_command "/usr/bin/pgrep",
                           args:         ["-f", "--", "--pid-file=" + pid_file],

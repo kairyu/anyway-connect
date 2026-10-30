@@ -1,4 +1,0 @@
-[
-  { "name": "lo0", "ipv4s": [{ "ipv4": "127.0.0.1", "prefixLength": 8 }],
-    "isUp": true, "isLoopback": true, "isPointToPoint": false }
-]

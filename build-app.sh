@@ -170,8 +170,6 @@ echo "  compiling $HELPER_BIN"
     -framework Foundation \
     -o "$APP/Contents/MacOS/$HELPER_BIN" \
     "$SRC_DIR/PrivilegedProtocol.swift" \
-    "$SRC_DIR/NetGuard.swift" \
-    "$SRC_DIR/NetReconcile.swift" \
     "$HELPER_SRC_DIR/main.swift"
 
 # --- Compile the app ---------------------------------------------------------
@@ -179,13 +177,10 @@ echo "  compiling $BIN"
 /usr/bin/swiftc -O \
     -target "$TARGET" \
     -framework AppKit -framework Foundation -framework ServiceManagement \
-    -framework Network \
     -o "$APP/Contents/MacOS/$BIN" \
     "$SRC_DIR/Config.swift" \
     "$SRC_DIR/PrivilegedProtocol.swift" \
     "$SRC_DIR/PrivilegedClient.swift" \
-    "$SRC_DIR/NetGuard.swift" \
-    "$SRC_DIR/NetReconcile.swift" \
     "$SRC_DIR/SingleInstance.swift" \
     "$SRC_DIR/ProfileImporter.swift" \
     "$SRC_DIR/AuthGroupSheet.swift" \

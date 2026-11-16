@@ -111,8 +111,7 @@ expect.call("pid file naming a process that has exited", :allowed)
 $fake_pid_file = "1\n"
 expect.call("pid file naming pid 1", :allowed)
 
-# kill(0, 0) signals the caller's whole process group, so 0 must never be probed. The
-# daemon has the same rule for the same reason; NetReconcile.swift spells it out.
+# kill(0, 0) signals the caller's whole process group, so 0 must never be probed.
 $fake_pid_file = "0\n"
 expect.call("pid file naming pid 0", :allowed)
 

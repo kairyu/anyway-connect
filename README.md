@@ -19,7 +19,7 @@ The name is a wink at Cisco AnyConnect: it connects *anyway*, on your terms.
 
 For how any of that actually behaves, see **[docs/FEATURES.md](docs/FEATURES.md)**.
 
-Requires macOS 13 or later.
+Requires macOS 14 or later.
 
 ## Install
 
@@ -184,15 +184,32 @@ sh scripts/anyway-diag.sh
 Answers one question in about twenty seconds: **is this AnywayConnect's fault,
 or something else on this machine?** It is read-only, needs no sudo, and never
 hangs, so it is safe to run mid-incident without reading it first. It checks the
-default routes against the same on-link guard the app itself uses, looks for
+default routes with its own on-link check, looks for
 leftover VPN routes and tunnel DNS overrides, probes each network layer
 separately, and counts recent errors from the other network extensions
 installed here — then gives one plain verdict, including "cannot tell" when that
 is the honest answer. Everything it collected is saved to
-`/tmp/anyway-diag-<timestamp>/`, redacted so it can be attached to a bug report.
+`~/Library/Logs/anyway-connect/diag-<timestamp>/`, which survives a reboot (the
+ten newest are kept), redacted so it can be attached to a bug report.
 `--quick` halves the runtime by skipping the log queries; see
 [docs/FEATURES.md](docs/FEATURES.md#diagnosing-a-wedged-network--scriptsanyway-diagsh)
 for what each section means.
+
+**The on-link route fix in 1.0.3.** Versions up to 1.0.2 also added an
+`-ifscope` copy of each on-link route (the local subnet, and any exception
+inside it), and nothing removed it. On a return to the same network it stayed
+bound to the interface's old address, which Private Wi-Fi Address rotation
+changes, so everything on that network, the router included, failed with errno
+49. 1.0.3 no longer adds the copy. After upgrading, open **Settings ▸ General ▸
+Privileged helper** and click **Update** (or **Install**), so the root-owned
+`route-wrapper.sh` is replaced. A leftover copy is removed the next time you
+connect on that network with "My local network" on, or by hand:
+
+```
+sudo route -n delete -net 10.0.1.0/24 -ifscope en0
+```
+
+Use your own subnet and interface.
 
 ## Compliance note
 

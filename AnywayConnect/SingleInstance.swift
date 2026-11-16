@@ -73,36 +73,6 @@ enum SingleInstance {
     }
 
     /// pid recorded by whoever holds the lock, if it is still alive.
-    ///
-    /// THE `kill(pid, 0)` BELOW IS DELIBERATE, AND THE EPERM RULE THAT GOVERNS THE
-    /// TEARDOWN PATH IS DELIBERATELY NOT APPLIED TO IT. Do not "fix" it.
-    ///
-    /// That rule — if a `kill(0)` survives app-side, `errno == EPERM` must be read
-    /// as ALIVE — exists for exactly one property: never conclude that A TUNNEL is
-    /// gone because you lack permission to signal it. The app runs as the desktop
-    /// user and every `openconnect` it starts runs as root, so there EPERM
-    /// genuinely means "alive, but not yours", and reading it as dead discards
-    /// bookkeeping about a live privileged session. That is why
-    /// `VPNRunner.anyStillAlive` is built on `/bin/ps` instead.
-    ///
-    /// This is not a tunnel-liveness check, and the rule would fix nothing here:
-    ///
-    ///   * the pid is a COURTESY FOR THE UI — it only decides whether a redundant
-    ///     launch can offer "Show Settings" or "Restart" — and never a correctness
-    ///     mechanism;
-    ///   * the `flock` above is what guarantees exclusivity, and it does so whether
-    ///     or not this answers;
-    ///   * the pid written into that file is always this app's own, so a genuine
-    ///     holder is SAME-UID and EPERM cannot arise for one;
-    ///   * the failure direction is the opposite one. A foreign pid read as dead
-    ///     fails toward LAUNCHING, not toward discarding state about something
-    ///     still running.
-    ///
-    /// Applying the rule here would therefore trade a bug that cannot occur for one
-    /// that can: a recycled pid now owned by another user would be reported as the
-    /// holder, and the redundant-instance dialog would offer to restart a process
-    /// that is not this app. Replacing the `kill(0)` with `/bin/ps` is not a way out
-    /// either — `ps -p` lists a foreign pid too, so it has the same effect.
     static func holderPID() -> pid_t? {
         guard let text = try? String(contentsOf: lockURL, encoding: .utf8),
               let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),

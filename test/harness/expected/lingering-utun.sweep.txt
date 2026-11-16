@@ -1,4 +1,0 @@
--n delete -net 100.81.0.0 -netmask 255.255.255.0
--n delete -net 100.81.0.0 -netmask 255.255.255.0 -ifscope utun8
--n delete -net 100.81.1.9 -netmask 255.255.255.255
--n delete -net 100.81.1.9 -netmask 255.255.255.255 -ifscope utun8

@@ -1,32 +1,10 @@
 import AppKit
 import Foundation
 
-/// One thing a power or path event decided to do. Ordered, so `[forceTeardown, reconcile]`
-/// means exactly that.
-enum NetStep: Equatable {
-    case forceTeardown                  // treat the tunnel as dead; never try to repair it
-    case reconcile
-    case redial(key: String)
-    case notify(String)
-}
-
-/// Everything such an event decides, AS DATA.
-///
-/// The flags live in here rather than being assigned inside the handlers because a harness
-/// has to assert them (AC-17) and cannot construct an `AppDelegate`: `busy`'s `didSet`
-/// reaches `VPNRunner.shared`, whose initialiser runs a real privileged reconcile.
-struct PowerPlan: Equatable {
-    var steps: [NetStep] = []
-    var suppressDisconnectEdge = false      // FR-3.8
-    var rememberKey: String? = nil          // the key to pin into lastEndpointKey
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var state: VPNState = .disconnected
-    /// Mirrored into VPNRunner so the path queue can read it safely. A `didSet` rather
-    /// than edits at the eight assignment sites, and it never fires during `init`.
-    var busy = false { didSet { VPNRunner.shared.setBusy(busy) } }
+    var busy = false
     var pollTimer: Timer?
     var settingsWC: SettingsWindowController?
 
@@ -38,51 +16,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var reconnectAttempts = 0
     var userInitiatedDisconnect = false
     private var busyWatchdog: Timer?
-
-    // MARK: - Power and path state (F3)
-
-    private var powerObservers: [NSObjectProtocol] = []
-
-    /// "A `.connected` -> `.disconnected` edge seen BEFORE this instant was ours."
-    ///
-    /// NOT sleep-specific: a teardown is planned by the wake path AND by the path-change
-    /// path, so a sleep-only name invited the bug this replaces — the flag set on a Wi-Fi
-    /// hop and never cleared, silently disabling auto-reconnect for the rest of the
-    /// session.
-    ///
-    /// A DEADLINE rather than a Bool, with two rules, each fixing a different way the 8s
-    /// `refresh()` poll beats a teardown that is not instantaneous (`boundedTeardown`
-    /// allows 5s, the daemon's graceful stop up to 10s, `teardownNow()` through the step
-    /// executor is unbounded):
-    ///
-    ///   1. CONSUMED ON THE EDGE, and otherwise only once expired. A Bool consumed on
-    ///      every tick is eaten by whichever tick lands first — that tick sees
-    ///      .connected -> .connected, clears it, and the REAL edge on the next tick posts
-    ///      "Dropped — reconnecting (1/N)…" and burns a retry on a disconnect we caused.
-    ///   2. SLEEP ARMS `.distantFuture`; WAKE OVERWRITES UNCONDITIONALLY. Sleep has no
-    ///      predictable duration and nothing of ours runs while it lasts, so any finite
-    ///      deadline armed in `handleWillSleep` is already expired on wake — while the
-    ///      poll timer's fire date passed during sleep, so it fires immediately and races
-    ///      `handleDidWake`. `.distantFuture` cannot expire during sleep, and the
-    ///      unconditional overwrite at wake is what bounds it, so a suppression can never
-    ///      outlive one sleep/wake cycle and latch auto-reconnect off.
-    var suppressDisconnectEdgeUntil: Date? = nil
-
-    /// Pure, so both branches are assertable without a running app.
-    static func shouldSuppress(edge: Bool, deadline: Date?, now: Date) -> Bool {
-        edge && (deadline.map { now < $0 } ?? false)
-    }
-
-    /// Serial, and non-reentrant by try-lock. One queue so two sequences cannot
-    /// interleave; the try-lock so a SECOND event is dropped with a logged reason rather
-    /// than queued behind a 90s reconcile and executed against a world that has moved on.
-    private let stepQueue = DispatchQueue(label: "me.kairyu.anywayconnect.steps",
-                                          qos: .userInitiated)
-    /// A semaphore, not an NSLock: the refusal has to happen on the NOTIFICATION thread
-    /// (dropping the second event is the point — a queue hop would queue it instead)
-    /// while the release happens on `stepQueue`, and NSLock forbids exactly that pairing.
-    /// `wait(timeout: .now())` is the try-lock, and a cross-thread `signal()` is allowed.
-    private let stepsRunning = DispatchSemaphore(value: 1)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -127,29 +60,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         schedulePlacementCheck(in: 6, attempt: 1)
         pollTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in self?.refresh() }
 
-        // F3. Sleep/wake and interface changes are what the 8s poll above cannot see: it
-        // only ever asks "is openconnect alive", which stays true with every route
-        // pointing at a gateway two networks away.
-        let nc = NSWorkspace.shared.notificationCenter
-        powerObservers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification,
-                                             object: nil, queue: .main) { [weak self] _ in
-            self?.handleWillSleep()
-        })
-        powerObservers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification,
-                                             object: nil, queue: .main) { [weak self] _ in
-            self?.handleDidWake()
-        })
-        // Seed the mirror: `busy`'s didSet does not fire for its initial value, and the
-        // launch reconcile consults it.
-        VPNRunner.shared.setBusy(busy)
-        // Invoked on VPNRunner's path queue, so the hop to main is ours to make.
-        VPNRunner.shared.onNetworkChange = { [weak self] primary in
-            DispatchQueue.main.async { self?.handleNetworkChange(primary) }
-        }
-        // Started here rather than in VPNRunner.init: the handler calls back into this
-        // object, so the app must be past launch before an update can arrive.
-        VPNRunner.shared.startPathMonitor()
-
         // A second launch hands off to us rather than starting a rival instance.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showSettingsOnRelaunch),
@@ -166,18 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, andSelector: #selector(handleReopenEvent(_:withReply:)),
             forEventClass: AEEventClass(kCoreEventClass),
             andEventID: AEEventID(kAEReopenApplication))
-    }
-
-    /// New: there was no `applicationWillTerminate` before F3.
-    ///
-    /// NSWorkspace's notification centre holds its observers without owning them, and the
-    /// path monitor keeps a queue and a handler alive, so quitting without this leaves
-    /// both running against an object that is on its way out.
-    func applicationWillTerminate(_ notification: Notification) {
-        let nc = NSWorkspace.shared.notificationCenter
-        for o in powerObservers { nc.removeObserver(o) }
-        powerObservers.removeAll()
-        VPNRunner.shared.stopPathMonitor()
     }
 
     /// Guards against stacking one alert per impatient double-click.
@@ -656,29 +554,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func refresh() {
         let newState = VPNRunner.shared.currentState()
-        var edge = false
-        if case .connected = state, case .disconnected = newState { edge = true }
-        // FR-3.8: a disconnect WE planned must not look like a drop. Computed before the
-        // consumption below, since that clears the deadline this reads.
-        let suppressed = Self.shouldSuppress(edge: edge, deadline: suppressDisconnectEdgeUntil,
-                                             now: Date())
-        // Consumed on the edge; otherwise only once it has expired, so a tick landing
-        // inside the teardown window leaves a live deadline alone.
-        if edge || (suppressDisconnectEdgeUntil.map { $0 <= Date() } ?? false) {
-            suppressDisconnectEdgeUntil = nil
-        }
-        if edge, !busy, !userInitiatedDisconnect, !suppressed {
+        if case .connected = state, case .disconnected = newState, !busy, !userInitiatedDisconnect {
             handleUnexpectedDisconnect()
         }
         state = newState
-        if case let .connected(key, _) = newState {
-            lastEndpointKey = key
-            reconnectAttempts = 0
-            // Cleared here as well as above so the suppression is bounded even if the
-            // wake handler never runs: being connected again means whatever edge the
-            // deadline was armed for is over and done with.
-            suppressDisconnectEdgeUntil = nil
-        }
+        if case let .connected(key, _) = newState { lastEndpointKey = key; reconnectAttempts = 0 }
         updateButton(); rebuildMenu()
     }
 
@@ -691,245 +571,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(ar.retryDelaySeconds)) { [weak self] in
             self?.startConnect(key)
         }
-    }
-
-    // MARK: - Sleep, wake and network change (F3)
-    //
-    // Each handler is "decide a plan, apply its flags on the main thread, then execute
-    // its steps in order". That shape is what makes "reconcile BEFORE any re-dial" and
-    // "at most one re-dial" assertions about a value; the executor below is what makes
-    // them true in time as well.
-
-    /// The honest outcome when nobody can be asked to sign in. Named rather than inlined
-    /// so the deciders and their assertions cannot drift apart.
-    static let redialUnavailableNotice = "VPN dropped — open AnywayConnect to sign in"
-
-    /// Every decider takes the transport, which pulls FR-2.10c's reasoning into the pure
-    /// layer: on `.interactiveSudo` a teardown would be a `sudo kill -INT` *without* `-n`
-    /// and a reconcile a password prompt nobody is there to answer. All three therefore
-    /// return an empty plan, which is exactly today's behaviour on such a machine.
-    static func decideWillSleep(state: VPNState, busy: Bool,
-                                transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
-        guard transport != .interactiveSudo else { return PowerPlan() }
-        // Not while a connect is in flight: its own teardown/restore sequence is already
-        // mid-flight and racing it would leave the routing half-written.
-        guard !busy, case let .connected(key, _) = state else { return PowerPlan() }
-        // Tearing down WHILE THE OLD NETWORK IS STILL PRESENT is the whole point: it is
-        // what lets vpnc-script's own `reason=disconnect` run against the gateway the
-        // routes were built for (FR-3.7).
-        return PowerPlan(steps: [.forceTeardown], suppressDisconnectEdge: true,
-                         rememberKey: key)
-    }
-
-    static func decideDidWake(state: VPNState, busy: Bool, rememberedKey: String?,
-                              autoReconnectEnabled: Bool,
-                              transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
-        guard transport != .interactiveSudo else { return PowerPlan() }
-        guard !busy else { return PowerPlan() }      // a connect is in flight; do not fight it
-        var plan = PowerPlan()
-        if case let .connected(key, _) = state {
-            // Teardown FIRST when the process is still alive: reconcile gates itself off
-            // on a live pid (FR-2.2), so emitting it first here would be a guaranteed
-            // no-op and the stale routing would survive the wake.
-            plan.steps = [.forceTeardown, .reconcile]
-            plan.suppressDisconnectEdge = true
-            plan.rememberKey = key
-            // A teardown really did just happen, so FR-3.10's notification is the
-            // honest answer when nobody can be asked to sign in.
-            plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
-                                              autoReconnectEnabled: autoReconnectEnabled,
-                                              notifyWhenUnavailable: true)
-        } else {
-            plan.steps = [.reconcile]
-            // NO NOTIFICATION ON THIS BRANCH. Nothing dropped: the app was already
-            // disconnected before the sleep, and `lastEndpointKey` does not persist
-            // across launches, so the suffix used to deliver "VPN dropped — open
-            // AnywayConnect to sign in" on every wake of a machine that had never
-            // connected. That is the noise FR-3.10 is not about.
-            //
-            // The RE-DIAL stays, which is the one place this decider deliberately
-            // diverges from decideNetworkChange, and the divergence is not an
-            // oversight to be tidied away: a wake follows a SLEEP, and a sleep may
-            // have torn a tunnel down — handleWillSleep's own boundedTeardown does
-            // exactly that, and the 8s `refresh()` poll races handleDidWake on the
-            // way out of sleep (see `suppressDisconnectEdgeUntil`), so a tunnel this
-            // app tore down at sleep can perfectly well be reported `.disconnected`
-            // by the time we get here. Dropping the re-dial would mean a laptop
-            // carried home asleep comes back with no tunnel and no attempt to get one
-            // — symptom 1 of the reported incident. A Wi-Fi hop while already
-            // disconnected, by contrast, tore nothing down, so there is nothing there
-            // to re-dial for.
-            plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
-                                              autoReconnectEnabled: autoReconnectEnabled,
-                                              notifyWhenUnavailable: false)
-        }
-        return plan
-    }
-
-    static func decideNetworkChange(state: VPNState, busy: Bool, rememberedKey: String?,
-                                    autoReconnectEnabled: Bool,
-                                    transport: VPNRunner.PrivilegedTransport) -> PowerPlan {
-        guard transport != .interactiveSudo else { return PowerPlan() }
-        guard !busy else { return PowerPlan() }
-        var plan = PowerPlan()
-        guard case let .connected(key, _) = state else {
-            // Already disconnected and the network just moved: this is precisely the
-            // stranded case reconcile exists for, and notifying on every Wi-Fi hop while
-            // not connected would be noise.
-            //
-            // No re-dial either, unlike decideDidWake's otherwise-identical branch.
-            // That asymmetry is DELIBERATE: a path change tore nothing down, so there
-            // is nothing to restore, whereas a wake may follow a sleep in which this
-            // app itself tore a live tunnel down. Making the two agree would either
-            // re-dial on every Wi-Fi hop or abandon a tunnel the sleep removed.
-            plan.steps = [.reconcile]
-            return plan
-        }
-        // Never an attempt to repair a half-live tunnel (FR-3.5): its routes were built
-        // for a gateway that is no longer on this network.
-        plan.steps = [.forceTeardown, .reconcile]
-        plan.suppressDisconnectEdge = true
-        plan.rememberKey = key
-        plan.steps += Self.redialOrNotify(rememberedKey: rememberedKey,
-                                          autoReconnectEnabled: autoReconnectEnabled,
-                                          notifyWhenUnavailable: true)
-        return plan
-    }
-
-    /// The suffix of every re-dialling plan, and STILL the single place a `.redial` is
-    /// ever emitted — which is the mechanism behind "at most one re-dial per event"
-    /// (FR-3.10): a re-dial or a notification, never both and never two.
-    ///
-    /// `notifyWhenUnavailable` is what the wake path turns off. A notification is only
-    /// honest when something was actually lost, so it is emitted on the branches where
-    /// a teardown was just planned and suppressed on the wake branch that found the app
-    /// already disconnected. Expressed as a parameter rather than by skipping the call,
-    /// so the re-dial decision keeps living in one function.
-    private static func redialOrNotify(rememberedKey: String?,
-                                       autoReconnectEnabled: Bool,
-                                       notifyWhenUnavailable: Bool) -> [NetStep] {
-        if autoReconnectEnabled, let key = rememberedKey { return [.redial(key: key)] }
-        return notifyWhenUnavailable ? [.notify(Self.redialUnavailableNotice)] : []
-    }
-
-    func handleWillSleep() {
-        let p = Self.decideWillSleep(state: state, busy: busy,
-                                     transport: VPNRunner.shared.cachedTransportSnapshot())
-        NSLog("AnywayConnect: willSleep — \(p)")
-        // `.distantFuture`, not now + 60: nothing of ours runs while the machine is
-        // asleep and sleep's duration is unknown, so any finite deadline armed here is a
-        // coin flip on wake. handleDidWake's unconditional overwrite is what bounds it.
-        if p.suppressDisconnectEdge { suppressDisconnectEdgeUntil = .distantFuture }
-        if let k = p.rememberKey { lastEndpointKey = k }
-        // The ONE synchronous path, and the only main-thread block permitted here: macOS
-        // does not wait indefinitely for willSleep observers, so the teardown has to be
-        // attempted now, bounded at FR-3.7's 5s.
-        //
-        // It deliberately BYPASSES runSteps, and is therefore the one documented
-        // exception to "at most one event's sequence runs at a time": the whole value of
-        // a will-sleep teardown is that it happens before the network disappears, and it
-        // is bounded and idempotent, so overlapping a wake sequence cannot compound.
-        if p.steps.contains(.forceTeardown) { boundedTeardown(limit: 5) }
-        NSLog("AnywayConnect: willSleep done")
-    }
-
-    func handleDidWake() {
-        let p = Self.decideDidWake(state: state, busy: busy, rememberedKey: lastEndpointKey,
-                                   autoReconnectEnabled: ConfigStore.shared.config.general
-                                       .autoReconnect.enabled,
-                                   transport: VPNRunner.shared.cachedTransportSnapshot())
-        NSLog("AnywayConnect: didWake — \(p)")
-        // UNCONDITIONAL, not `if p.suppressDisconnectEdge`: this is the only thing that
-        // bounds the `.distantFuture` handleWillSleep armed, so a suppression cannot
-        // survive the wake that consumes it.
-        suppressDisconnectEdgeUntil = p.suppressDisconnectEdge
-            ? Date().addingTimeInterval(60) : nil
-        if let k = p.rememberKey { lastEndpointKey = k }
-        runSteps(p.steps, event: "wake")
-    }
-
-    func handleNetworkChange(_ primary: String) {
-        let p = Self.decideNetworkChange(state: state, busy: busy,
-                                         rememberedKey: lastEndpointKey,
-                                         autoReconnectEnabled: ConfigStore.shared.config.general
-                                             .autoReconnect.enabled,
-                                         transport: VPNRunner.shared.cachedTransportSnapshot())
-        NSLog("AnywayConnect: path change -> \(primary) — \(p)")
-        // Conditional here, unlike the wake: a path change must not clear a live sleep
-        // suppression it knows nothing about.
-        if p.suppressDisconnectEdge { suppressDisconnectEdgeUntil = Date().addingTimeInterval(60) }
-        if let k = p.rememberKey { lastEndpointKey = k }
-        runSteps(p.steps, event: "netchange")
-    }
-
-    private func runSteps(_ steps: [NetStep], event: String) {
-        guard !steps.isEmpty else { return }
-        // The try-lock, taken on the notification thread: the carry-home transition
-        // produces a wake AND a debounced path change, and without this they would start
-        // two executors whose `.forceTeardown` steps race on teardownNow().
-        guard stepsRunning.wait(timeout: .now()) == .success else {
-            NSLog("AnywayConnect: \(event): steps skipped — a sequence is already in flight")
-            return
-        }
-        // The SEMAPHORE itself is captured, not `self`: a deallocated AppDelegate must
-        // not strand the try-lock closed for the rest of the process's life.
-        let sem = stepsRunning
-        stepQueue.async { [weak self] in
-            defer { sem.signal() }
-            guard let self else { return }
-            for step in steps {
-                switch step {
-                case .forceTeardown:
-                    // No DispatchQueue.main.sync anywhere in this executor: the flags
-                    // were applied by the handler before dispatch, and will-sleep can
-                    // hold main for up to 5s, so a main.sync here would be a 5s stall.
-                    VPNRunner.shared.teardownNow()
-                case .reconcile:
-                    _ = VPNRunner.shared.reconcileNow(reason: event)    // BLOCKS, by design
-                case .redial(let key):
-                    // async, not sync: `.redial` is the LAST step of every plan, so
-                    // nothing downstream waits on it, and startConnect must run on main.
-                    DispatchQueue.main.async { self.beginRedial(key) }
-                case .notify(let text):
-                    DispatchQueue.main.async { self.notify(text) }
-                }
-            }
-            NSLog("AnywayConnect: \(event): steps complete (\(steps.count))")
-        }
-    }
-
-    private func beginRedial(_ key: String) {
-        NSLog("AnywayConnect: re-dialling \(key) — one attempt")
-        // ── F5 SEAM ──────────────────────────────────────────────────────────────────
-        // One attempt, never more. startConnect routes into interactive browser SSO
-        // (--external-browser), so an unattended re-dial cannot complete: burning
-        // maxRetries here would produce five useless notifications and nothing else.
-        // Making this succeed with no user present means caching or reusing the session
-        // cookie, which is F5 and explicitly out of scope. Do not add a retry loop
-        // here, and do not cache the cookie here; fix F5 instead.
-        //
-        // The one-attempt bound comes from the decided plan — decideDidWake and
-        // decideNetworkChange each emit at most one .redial — and runSteps drops a
-        // second event's sequence while one is in flight. reconnectAttempts is
-        // therefore reset freely: if the user IS present and this attempt succeeds, a
-        // later genuine drop still gets the full configured budget from
-        // handleUnexpectedDisconnect().
-        // ─────────────────────────────────────────────────────────────────────────────
-        reconnectAttempts = 0
-        startConnect(key)       // itself a no-op while `busy`
-    }
-
-    /// Tear the tunnel down off-main but wait for it, for at most `limit` seconds.
-    private func boundedTeardown(limit: TimeInterval) {
-        let done = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            VPNRunner.shared.teardownNow()
-            done.signal()
-        }
-        // On expiry we return and let it finish in the background rather than hold the
-        // main thread: the tunnel either came down on the old network — the point of
-        // doing this at all — or the wake's reconcile cleans up after it.
-        _ = done.wait(timeout: .now() + limit)
     }
 
     // MARK: - Actions
@@ -1014,25 +655,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         /// off to a browser for SSO and someone has to read an MFA prompt.
         ///
         /// A disconnect gets 60s, because nothing in that path waits for a person. Its
-        /// worst case is `teardownNow()`'s own bounds added up: up to 3s probing the
-        /// privileged transport, up to 30s for the daemon's `stopTunnel` XPC call
-        /// (`pgrep` 5s + `ps` 3s + the 10s SIGINT wait + the 5s SIGTERM wait = 23s in
-        /// the daemon, plus slack), then 3s for the batched `ps` that establishes which
-        /// discovered pids are ours, up to 5s for `helperIsUsable()` and ~10s in the
-        /// shell helper's `stop`, which SIGINTs openconnect, waits 10s and only then
-        /// escalates to SIGTERM — the daemon's own `stopTunnel` does the same. That is
-        /// 3 + 30 + 3 + 5 + 10 ≈ 51s, so 60s still cannot fire on a merely slow
-        /// teardown, with the margin roughly halved.
-        ///
-        /// Those last three terms used to describe a path that could not be taken: the
-        /// daemon's reply was unconditionally `ok`, so the daemon arm always returned
-        /// and the sudo fallback was unreachable after a daemon stop. It is REACHABLE
-        /// now — a stop that found something and did not stop it replies `.failed`, on
-        /// which the app keeps its endpoint record and falls through.
-        ///
-        /// Reusing 240s here would leave the user with no way back for four minutes,
-        /// which matters more now that the escape hatch is not offered during a
-        /// disconnect.
+        /// worst case is `disconnectSync()`'s own bounds added up: up to 3s probing the
+        /// privileged transport, up to 20s for the daemon's `stopTunnel` XPC call, then
+        /// on a daemon failure up to 5s for `helperIsUsable()` and ~10s in the shell
+        /// helper's `stop`, which SIGINTs openconnect, waits 10s and only then escalates
+        /// to SIGTERM — the daemon's own `stopTunnel` does the same. That is ~38s, so 60s
+        /// cannot fire on a merely slow teardown and still recovers the menu in about a
+        /// minute rather than four. Reusing 240s here would leave the user with no way
+        /// back for four minutes, which matters more now that the escape hatch is not
+        /// offered during a disconnect.
         var timeout: TimeInterval {
             switch self {
             case .connect:    return 240
